@@ -281,6 +281,19 @@ In `core`, four tools are destructive (`stop_deployment`, `cancel_experiment`, `
 
 The sequences below show how the tools compose. Arrows show which response field drives the next call. "Poll" means the agent calls a `get_*` tool again after `poll_after_seconds`, whenever it chooses to; "wait" means the agent opts into a bounded `wait_seconds` inside one call. In every workflow, progress is made by Lens, not by the calls.
 
+### 6.0 Common requests at a glance
+
+| What the person asks the agent | Tools the agent calls, in order | Workflow |
+| --- | --- | --- |
+| "Deploy Qwen3-8B on the XPU cluster" | `list_clusters` → `search_models` → `get_model` → (`cache_model`) → `list_guides` → `plan_deployment` → `create_deployment` → `get_deployment` → `test_deployment` | 6.1 |
+| "Why is my deployment not ready?" | `get_deployment` → `diagnose_deployment` → `get_logs` → (`restart_deployment` or `stop_deployment`) | 6.2 |
+| "Compare prefill/decode ratios 1:3, 2:2 and 3:1 against the baseline" | `list_guides` → `plan_experiment` → `start_experiment` → (agent may exit) → `get_experiment` → `compare_results` | 6.3 |
+| "How fast is this running deployment?" | `start_benchmark` → `get_benchmark` | 6.4 |
+| "What was I running? Is it finished?" | `list_resources` → `get_experiment` or `get_deployment` | 6.5 |
+| "Clean up everything I created" | `list_resources` → `delete_resources` | 6.6 |
+| "Download this model to the cluster first" | `search_models` → `cache_model` → `get_model` | 6.7 |
+| "The experiment failed halfway" | `get_experiment` → `diagnose_deployment` → `retry_experiment` or `cancel_experiment` | 6.8 |
+
 ### 6.1 Deploy a model end to end
 
 Goal: serve `Qwen/Qwen3-8B` with a Lens guide and confirm it answers.
