@@ -79,6 +79,25 @@ def plan_routes(api: FakeApi) -> None:
     cluster_routes(api)
     api.on("POST", "/guide-planning/plan", load_plan())
     api.on(
+        "GET",
+        "/storage/volumes",
+        {"items": [{"id": "storage-1", "name": "cache", "status": "ready", "purposes": ["model-cache"]}]},
+    )
+    api.on(
+        "GET",
+        "/model-cache/entries",
+        {
+            "items": [
+                {
+                    "id": "mce-1",
+                    "status": "ready",
+                    "storageVolumeId": "storage-1",
+                    "source": {"huggingface": {"repoId": "Qwen/Qwen3-0.6B", "revision": "main"}},
+                }
+            ]
+        },
+    )
+    api.on(
         "POST",
         "/configurations/render",
         lambda params, body: {

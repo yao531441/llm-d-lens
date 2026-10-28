@@ -53,6 +53,13 @@ class DeploymentSpec(BaseModel):
     topology: Topology = Field(default_factory=Topology, description="Replicas and tensor parallelism per role.")
     engine: EngineSpec = Field(default_factory=EngineSpec)
     runtime_image: str | None = Field(default=None, description="Override the model-server image.")
+    model_cache_volume_id: str | None = Field(
+        default=None,
+        description=(
+            "Model-cache storage volume (Lens id or vol- id) that already holds the model. "
+            "Chosen automatically when exactly one ready volume has it; otherwise call cache_model first."
+        ),
+    )
 
 
 @dataclass(frozen=True)

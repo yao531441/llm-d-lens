@@ -13,6 +13,7 @@ from .context import ToolContext
 from .deploy_spec import DeploymentSpec, EngineSpec, PlanParams, RoleSpec, Topology, gpus_total, plan_params, role_gpus
 from .errors import ToolError
 from .ledger import PLAN_TTL_SECONDS
+from .models_cache import entries_for_model, list_entries, resolve_volume
 
 _POD_TEMPLATE_PATHS = (("spec", "template"), ("spec", "leaderWorkerTemplate", "workerTemplate"))
 
@@ -91,7 +92,9 @@ def resolve_guide(catalog: dict[str, Any], guide: str, accelerator: str, server:
     return server, variant
 
 
-def planning_request(args, *, accelerator: str, server: str, variant: str, session_id: str) -> dict[str, Any]:
+def planning_request(
+    args, *, accelerator: str, server: str, variant: str, session_id: str, volume: dict[str, Any]
+) -> dict[str, Any]:
     is_pd = args.guide == "pd-disaggregation"
     request: dict[str, Any] = {
         "guide": args.guide,
@@ -99,7 +102,10 @@ def planning_request(args, *, accelerator: str, server: str, variant: str, sessi
         "modelServer": server,
         "guideVariant": variant,
         "model": args.model,
-        "modelSource": "huggingface",
+        "modelSource": "auto-cache",
+        "modelPath": "",
+        "modelStorageKind": volume.get("kind") or "",
+        "modelPvcClaimName": volume.get("pvcName") or "",
         "replicas": args.replicas,
         "tensorParallelSize": args.tensor_parallel_size,
         "decodeReplicas": args.replicas,
@@ -115,7 +121,9 @@ def planning_request(args, *, accelerator: str, server: str, variant: str, sessi
     return request
 
 
-def candidate_config(args, *, cluster: dict[str, Any], server: str, variant: str, image: str) -> dict[str, Any]:
+def candidate_config(
+    args, *, cluster: dict[str, Any], server: str, variant: str, image: str, volume: dict[str, Any]
+) -> dict[str, Any]:
     is_pd = args.guide == "pd-disaggregation"
     serving = {"replicas": args.replicas, "tensor_parallel_size": args.tensor_parallel_size}
     decode = dict(serving)
@@ -142,10 +150,10 @@ def candidate_config(args, *, cluster: dict[str, Any], server: str, variant: str
             "buildSourceUrl": "",
             "modelServer": server,
             "resourceBasis": "available",
-            "modelPvcClaimName": "",
-            "modelSource": "huggingface",
+            "modelPvcClaimName": volume.get("pvcName") or "",
+            "modelSource": "auto-cache",
             "mountPath": "",
-            "storageVolumeId": "",
+            "storageVolumeId": volume["id"],
         },
     }
 
@@ -173,6 +181,41 @@ def resolved_spec(
     )
 
 
+async def cached_volume(ctx: ToolContext, cluster_id: str, model: str, requested: str | None) -> dict[str, Any]:
+    """The model-cache volume holding a ready copy of ``model``; Lens deployments only start from a cache."""
+    entries = [
+        entry
+        for entry in entries_for_model(await list_entries(ctx, cluster_id), model, None)
+        if entry.get("status") == "ready"
+    ]
+    if requested:
+        volume = await resolve_volume(ctx, cluster_id, requested)
+        if not any(entry.get("storageVolumeId") == volume["id"] for entry in entries):
+            raise ToolError(
+                "model_not_cached",
+                f"{model} is not ready in volume {requested}.",
+                field="spec.model_cache_volume_id",
+                hint=f"Call cache_model(model='{model}', volume_id=...) and wait until it is ready.",
+            )
+        return volume
+    volumes = sorted({entry["storageVolumeId"] for entry in entries if entry.get("storageVolumeId")})
+    if len(volumes) == 1:
+        return await resolve_volume(ctx, cluster_id, volumes[0])
+    if not volumes:
+        raise ToolError(
+            "model_not_cached",
+            f"{model} is not downloaded into any model-cache volume on cluster {cluster_id}.",
+            field="spec.model",
+            hint=f"Call cache_model(cluster_id='{cluster_id}', model='{model}'), wait until ready, then plan again.",
+        )
+    raise ToolError(
+        "invalid_argument",
+        f"{model} is cached in {len(volumes)} volumes; choose one.",
+        field="spec.model_cache_volume_id",
+        choices=volumes,
+    )
+
+
 async def build_plan(ctx: ToolContext, spec: DeploymentSpec) -> dict[str, Any]:
     """Validate and render ``spec``, store the result as a plan and describe it. Raises ToolError when invalid."""
     params = plan_params(spec)
@@ -182,11 +225,14 @@ async def build_plan(ctx: ToolContext, spec: DeploymentSpec) -> dict[str, Any]:
     session_id, cluster = session["sessionId"], session["cluster"]
     catalog = await ctx.api.request("GET", "/guide-planning/catalog", params={"clusterId": params.cluster_id})
     server, variant = resolve_guide(catalog, params.guide, accelerator, params.model_server, params.variant)
+    volume = await cached_volume(ctx, params.cluster_id, params.model, spec.model_cache_volume_id)
 
     plan = await ctx.api.request(
         "POST",
         "/guide-planning/plan",
-        body=planning_request(params, accelerator=accelerator, server=server, variant=variant, session_id=session_id),
+        body=planning_request(
+            params, accelerator=accelerator, server=server, variant=variant, session_id=session_id, volume=volume
+        ),
         timeout=240,
     )
     validation = plan.get("validation") or {}
@@ -223,7 +269,9 @@ async def build_plan(ctx: ToolContext, spec: DeploymentSpec) -> dict[str, Any]:
         "POST",
         "/configurations/render",
         body={
-            "candidate_config": candidate_config(params, cluster=cluster, server=server, variant=variant, image=image),
+            "candidate_config": candidate_config(
+                params, cluster=cluster, server=server, variant=variant, image=image, volume=volume
+            ),
             "render": {
                 "format": "manifest",
                 "guide_ref": params.guide,
@@ -248,7 +296,7 @@ async def build_plan(ctx: ToolContext, spec: DeploymentSpec) -> dict[str, Any]:
     total, free = gpus_total(params), summary.get("accelerators_free")
     resolved = resolved_spec(
         spec, params, accelerator=accelerator, server=server, variant=variant, image=image, name=name
-    )
+    ).model_copy(update={"model_cache_volume_id": volume["id"]})
     if free is not None and total > free:
         warnings.append(
             {

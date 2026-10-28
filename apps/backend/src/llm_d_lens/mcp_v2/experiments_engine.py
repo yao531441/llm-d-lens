@@ -201,8 +201,22 @@ async def _poll_unit(ctx: ToolContext, s: dict[str, Any]) -> None:
         return
     status = run.get("status")
     if status == "succeeded":
-        unit.update(status="succeeded", result=unit_result(run), finished_epoch=time.time())
-        _event(s, f"{unit['id']}: succeeded")
+        result = unit_result(run)
+        rates = [(p.get("metrics") or {}).get("success_rate") for p in result["points"]] or [
+            result["metrics"].get("success_rate")
+        ]
+        if rates and all(rate == 0 for rate in rates):
+            message = (
+                "Lens finished the benchmark but every request failed (success rate 0%), so there is no measurement. "
+                "The load generator could not get answers from the deployment. Check get_logs and diagnose_deployment. "
+                "A borrowed deployment served through a shared Gateway is not reachable by the benchmark; "
+                "use an experiment-created spec variant instead."
+            )
+            unit.update(status="failed", error={"message": message}, finished_epoch=time.time())
+            _event(s, f"{unit['id']}: all requests failed")
+        else:
+            unit.update(status="succeeded", result=result, finished_epoch=time.time())
+            _event(s, f"{unit['id']}: succeeded")
     elif status == "failed":
         unit.update(status="failed", error=_run_error(run), finished_epoch=time.time())
         _event(s, f"{unit['id']}: failed")

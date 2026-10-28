@@ -101,6 +101,9 @@ async def launch_spec(
                     "created_via": CREATED_VIA,
                     "ledger_id": row.id,
                     "experiment_id": root_id,
+                    # Marks the deployment as evaluation-owned so Lens benchmarks it through its own router proxy.
+                    # Without it the harness is pointed at the shared Gateway, which rejects unpublished models.
+                    "evaluation_id": root_id,
                 },
             },
             timeout=120,

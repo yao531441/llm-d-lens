@@ -207,7 +207,25 @@ async def test_failed_benchmark_is_reported_and_deployment_still_deleted(api, ct
 
 
 @pytest.mark.asyncio
-async def test_cancel_stops_run_then_deletes_deployment_in_order(api, ctx, lens):
+async def test_a_run_where_every_request_failed_is_not_a_measurement(api, ctx, lens):
+    experiment_id = await start_spec(ctx)
+    lens.exec_status = "ready"
+    await run(ctx, "get_experiment", experiment_id=experiment_id)
+    dead = succeeded_run("ev-1")
+    for stage in dead["matrix_results"][0]["stage_metrics"]:
+        stage["metrics"]["success_rate"] = 0.0
+    lens.runs["ev-1"] = dead
+    done, _ = await run(ctx, "get_experiment", experiment_id=experiment_id)
+    assert done["state"]["execution"] == "failed" and done["state"]["measurement"]["valid_runs"] == 0
+    assert "every request failed" in done["variants"][0]["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_temporary_deployments_are_marked_evaluation_owned_for_lens(api, ctx, lens):
+    experiment_id = await start_spec(ctx)
+    body = api.called("POST", "/deployments/runs")[0]
+    assert body["provenance"]["evaluation_id"] == experiment_id
+
     experiment_id = await start_spec(ctx)
     lens.exec_status = "ready"
     await run(ctx, "get_experiment", experiment_id=experiment_id)

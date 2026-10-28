@@ -328,6 +328,8 @@ async def check_specs(ctx: ToolContext, design: dict[str, Any]) -> list[dict[str
                 "accelerators_free": (plan.get("resources") or {}).get("accelerators_free"),
             }
 
+    if not spec_variants:
+        return []
     tasks = {asyncio.ensure_future(one(v)): v for v in spec_variants}
     done, pending = await asyncio.wait(tasks, timeout=PLANNING_BUDGET_SECONDS)
     for task in pending:

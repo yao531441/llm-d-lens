@@ -838,3 +838,15 @@ async def test_test_deployment_requires_ready_deployment_and_at_most_20_requests
     assert is_error and payload["error"]["code"] == "conflict_state"
     payload, is_error = await call_tool(ctx, "test_deployment", {"deployment_id": deployment_id, "requests": 21})
     assert is_error and payload["error"]["code"] == "invalid_argument"
+
+
+@pytest.mark.asyncio
+async def test_plan_needs_the_model_in_a_model_cache_volume_and_records_it(api, ctx):
+    plan_routes(api)
+    payload, is_error = await call_tool(ctx, "plan_deployment", {"spec": SPEC})
+    assert not is_error and payload["resolved_spec"]["model_cache_volume_id"] == "storage-1"
+    api.on("GET", "/model-cache/entries", {"items": []})
+    payload, is_error = await call_tool(ctx, "plan_deployment", {"spec": SPEC})
+    assert not is_error and payload["status"] == "invalid"
+    error = payload["validation"]["errors"][0]
+    assert error["code"] == "model_not_cached" and "cache_model" in error["hint"]
