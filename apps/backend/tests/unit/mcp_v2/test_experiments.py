@@ -4,6 +4,9 @@ import pytest
 
 from llm_d_lens.mcp_v2 import experiments_engine as engine
 from llm_d_lens.mcp_v2.context import ToolContext
+from llm_d_lens.mcp_v2.errors import ToolError
+from llm_d_lens.mcp_v2.experiments_plan import ExperimentDesign as LegacyDesign
+from llm_d_lens.mcp_v2.experiments_plan import estimate, normalize
 from llm_d_lens.mcp_v2.lens_api import LensApiError
 from llm_d_lens.mcp_v2.registry import all_tools, call_tool
 
@@ -102,10 +105,25 @@ async def run(ctx: ToolContext, name: str, **arguments):
     return payload, is_error
 
 
+async def legacy_start(ctx: ToolContext, **design_args) -> str:
+    """Creates a legacy exp- experiment the way the retired start handler did; start_experiment no longer can."""
+    design = await normalize(ctx, LegacyDesign(**design_args))
+    estimates = await estimate(ctx, design)
+    row = ctx.ledger.add_resource(
+        kind="experiment",
+        owner=ctx.owner,
+        cluster_id=design["cluster_id"],
+        name=design["name"] or "legacy-experiment",
+        state="creating",
+    )
+    ctx.ledger.update_meta(row.id, engine.initial_state(row.id, design, None, estimates["unit_seconds"]))
+    ctx.ledger.set_state(row.id, "active")
+    await engine.advance(ctx, row.id)
+    return row.id
+
+
 async def start_spec(ctx: ToolContext, **extra) -> str:
-    payload, is_error = await run(ctx, "start_experiment", cluster_id="c1", variants=[SPEC_VARIANT], **extra)
-    assert not is_error, payload
-    return payload["experiment_id"]
+    return await legacy_start(ctx, cluster_id="c1", variants=[SPEC_VARIANT], **extra)
 
 
 def test_annotations_follow_the_delta_table():
@@ -116,49 +134,60 @@ def test_annotations_follow_the_delta_table():
     assert tools["start_experiment"].open_world
     cancel = tools["cancel_experiment"]
     assert cancel.destructive and cancel.idempotent and not cancel.read_only
+    assert not tools["retry_experiment"].read_only and not tools["retry_experiment"].destructive
 
 
 @pytest.mark.asyncio
-async def test_plan_reports_estimates_and_creates_nothing(api, ctx, lens):
-    payload, is_error = await run(
+async def test_legacy_estimates_and_creates_nothing(api, ctx, lens):
+    design = await normalize(
         ctx,
-        "plan_experiment",
-        cluster_id="c1",
-        variants=[SPEC_VARIANT, {"variant_id": "tp2", "spec": {**SPEC, "tensor_parallel_size": 2}}],
-        rigor="standard",
+        LegacyDesign(
+            cluster_id="c1",
+            variants=[SPEC_VARIANT, {"variant_id": "tp2", "spec": {**SPEC, "tensor_parallel_size": 2}}],
+            rigor="standard",
+        ),
     )
-    assert not is_error, payload
-    assert payload["status"] in ("valid", "valid_with_warnings") and payload["plan_id"]
-    assert payload["benchmark_runs"] == 2 * 1 * 3
-    assert payload["resources"]["peak_gpus"] == 2 and payload["resources"]["gpu_hours_estimate"] > 0
-    assert any(w["code"] == "UNEQUAL_GPU_BUDGET" for w in payload["validation"]["warnings"])
+    estimates = await estimate(ctx, design)
+    assert estimates["resources"]["peak_gpus"] == 2 and estimates["resources"]["gpu_hours_estimate"] > 0
+    assert any(w["code"] == "UNEQUAL_GPU_BUDGET" for w in estimates["warnings"])
     assert api.called("POST", "/deployments/runs") == [] and api.called("POST", "/evaluate/runs") == []
 
 
 @pytest.mark.asyncio
-async def test_plan_over_budget_is_invalid_without_plan_id(api, ctx, lens):
-    payload, is_error = await run(ctx, "plan_experiment", cluster_id="c1", variants=[SPEC_VARIANT], max_gpu_hours=0.001)
-    assert not is_error and payload["status"] == "invalid" and "plan_id" not in payload
-    assert payload["validation"]["errors"][0]["code"] == "MAX_GPU_HOURS_EXCEEDED"
+async def test_legacy_over_budget_is_an_error(api, ctx, lens):
+    design = await normalize(ctx, LegacyDesign(cluster_id="c1", variants=[SPEC_VARIANT], max_gpu_hours=0.001))
+    assert (await estimate(ctx, design))["errors"][0]["code"] == "MAX_GPU_HOURS_EXCEEDED"
 
 
 @pytest.mark.asyncio
 async def test_borrowed_variants_must_be_owned_and_ready(api, ctx, lens):
-    unknown, is_error = await run(ctx, "plan_experiment", variants=[{"variant_id": "x", "deployment_id": "dep-nope"}])
-    assert is_error and unknown["error"]["code"] == "owner_unknown"
+    with pytest.raises(ToolError) as unknown:
+        await normalize(ctx, LegacyDesign(variants=[{"variant_id": "x", "deployment_id": "dep-nope"}]))
+    assert unknown.value.code == "owner_unknown"
     other = borrow(ctx, api, "exec-o", owner="someone-else")
-    refused, is_error = await run(ctx, "plan_experiment", variants=[{"variant_id": "x", "deployment_id": other}])
-    assert is_error and refused["error"]["code"] == "not_owner"
+    with pytest.raises(ToolError) as refused:
+        await normalize(ctx, LegacyDesign(variants=[{"variant_id": "x", "deployment_id": other}]))
+    assert refused.value.code == "not_owner"
     pending = borrow(ctx, api, "exec-p")
     api.on("GET", "/deployments/executions/exec-p", {"status": "deploying"})
-    state, is_error = await run(ctx, "plan_experiment", variants=[{"variant_id": "x", "deployment_id": pending}])
-    assert is_error and state["error"]["code"] == "conflict_state"
+    with pytest.raises(ToolError) as state:
+        await normalize(ctx, LegacyDesign(variants=[{"variant_id": "x", "deployment_id": pending}]))
+    assert state.value.code == "conflict_state"
 
 
 @pytest.mark.asyncio
 async def test_interleaved_order_needs_parallel_schedule(api, ctx, lens):
-    payload, is_error = await run(ctx, "plan_experiment", cluster_id="c1", variants=[SPEC_VARIANT], order="interleaved")
-    assert is_error and payload["error"]["field"] == "order"
+    with pytest.raises(ToolError) as error:
+        await normalize(ctx, LegacyDesign(cluster_id="c1", variants=[SPEC_VARIANT], order="interleaved"))
+    assert error.value.field == "order"
+
+
+@pytest.mark.asyncio
+async def test_start_experiment_no_longer_creates_legacy_experiments(api, ctx, lens):
+    payload, is_error = await run(ctx, "start_experiment", cluster_id="c1", variants=[SPEC_VARIANT])
+    assert is_error and payload["error"]["code"] == "invalid_argument"
+    assert ctx.ledger.list_resources(owner=ctx.owner, kind="experiment") == []
+    assert api.called("POST", "/deployments/runs") == []
 
 
 @pytest.mark.asyncio
@@ -254,11 +283,7 @@ async def test_cancel_waits_for_a_run_that_is_still_cancelling(api, ctx, lens, m
 @pytest.mark.asyncio
 async def test_borrowed_deployment_is_benchmarked_and_never_deleted(api, ctx, lens):
     deployment_id = borrow(ctx, api)
-    payload, is_error = await run(
-        ctx, "start_experiment", variants=[{"variant_id": "mine", "deployment_id": deployment_id}]
-    )
-    assert not is_error, payload
-    experiment_id = payload["experiment_id"]
+    experiment_id = await legacy_start(ctx, variants=[{"variant_id": "mine", "deployment_id": deployment_id}])
     (benchmark,) = api.called("POST", "/evaluate/runs")
     assert benchmark["deployment_execution_id"] == "exec-b"
     lens.runs["ev-1"] = succeeded_run("ev-1")
@@ -312,29 +337,15 @@ async def test_failed_cleanup_is_reported_as_residual_and_retried(api, ctx, lens
 
 
 @pytest.mark.asyncio
-async def test_same_plan_id_starts_only_one_experiment(api, ctx, lens):
-    plan, _ = await run(ctx, "plan_experiment", cluster_id="c1", variants=[SPEC_VARIANT])
-    first, _ = await run(ctx, "start_experiment", plan_id=plan["plan_id"])
-    second, _ = await run(ctx, "start_experiment", plan_id=plan["plan_id"])
-    assert second["experiment_id"] == first["experiment_id"] and second["already_started"]
-    assert len(api.called("POST", "/deployments/runs")) == 1
-
-
-@pytest.mark.asyncio
 async def test_compare_results_reports_deltas_and_mismatches(api, ctx, lens):
     first_dep, second_dep = borrow(ctx, api, "exec-b"), borrow(ctx, api, "exec-c")
     refs = []
     for index, (dep, preset, model) in enumerate(
         [(first_dep, "chat", SPEC["model"]), (second_dep, "latency-sweep", "other/model")], start=1
     ):
-        payload, is_error = await run(
-            ctx,
-            "start_experiment",
-            variants=[{"variant_id": "v", "deployment_id": dep}],
-            workloads=[{"preset": preset}],
+        experiment_id = await legacy_start(
+            ctx, variants=[{"variant_id": "v", "deployment_id": dep}], workloads=[{"preset": preset}]
         )
-        assert not is_error, payload
-        experiment_id = payload["experiment_id"]
         lens.runs[f"ev-{index}"] = succeeded_run(f"ev-{index}", ttft_p99=800.0 * index, tps=500.0 / index, model=model)
         await run(ctx, "get_experiment", experiment_id=experiment_id)
         refs.append(f"{experiment_id}#v/{preset}")
@@ -419,7 +430,7 @@ async def test_cancelled_create_keeps_the_row_and_resumes_without_a_duplicate(ap
 
     api.on("POST", "/deployments/runs", interrupted)
     with pytest.raises(asyncio.CancelledError):
-        await call_tool(ctx, "start_experiment", {"cluster_id": "c1", "variants": [SPEC_VARIANT]})
+        await start_spec(ctx)
     (experiment,) = ctx.ledger.list_resources(owner=ctx.owner, kind="experiment")
     (dep,) = ctx.ledger.children(experiment.id)
     assert dep.state == "creating" and ctx.ledger.acquire_lease(lease_key(experiment.id), "after", 60)
@@ -434,21 +445,13 @@ async def test_cancelled_create_keeps_the_row_and_resumes_without_a_duplicate(ap
 @pytest.mark.asyncio
 async def test_partial_cancel_keeps_the_deployment_the_user_asked_to_keep(api, ctx, lens):
     borrowed = borrow(ctx, api)
-    payload, is_error = await run(
-        ctx,
-        "start_experiment",
-        cluster_id="c1",
-        variants=[SPEC_VARIANT, {"variant_id": "mine", "deployment_id": borrowed}],
+    experiment_id = await legacy_start(
+        ctx, cluster_id="c1", variants=[SPEC_VARIANT, {"variant_id": "mine", "deployment_id": borrowed}]
     )
-    assert not is_error, payload
-    experiment_id = payload["experiment_id"]
     (dep,) = ctx.ledger.children(experiment_id)
     lens.exec_status = "ready"
     await run(ctx, "get_experiment", experiment_id=experiment_id)
-    cancelled, is_error = await run(
-        ctx, "cancel_experiment", experiment_id=experiment_id, variant_ids=["base"], keep_deployments=True
-    )
-    assert not is_error, cancelled
+    await engine.request_cancel(ctx, experiment_id, variant_ids=["base"], keep_deployments=True, reason=None)
     assert api.called("DELETE", "/deployments/executions/exec-1") == []
     meta = ctx.ledger.get(experiment_id).meta
     assert meta["variants"]["base"]["cleanup"] == "kept" and meta["cancel"] is None
@@ -474,7 +477,7 @@ async def test_cancel_that_lens_never_confirms_is_closed_locally_after_the_timeo
 
 
 @pytest.mark.asyncio
-async def test_start_returns_the_experiment_id_even_if_the_first_step_breaks(api, ctx, lens, monkeypatch):
+async def test_a_legacy_experiment_whose_first_step_broke_is_resumed_by_get(api, ctx, lens, monkeypatch):
     original = engine._reconcile
     calls = []
 
@@ -485,8 +488,9 @@ async def test_start_returns_the_experiment_id_even_if_the_first_step_breaks(api
         await original(ctx, s)
 
     monkeypatch.setattr(engine, "_reconcile", flaky)
-    payload, is_error = await run(ctx, "start_experiment", cluster_id="c1", variants=[SPEC_VARIANT])
-    assert not is_error and payload["started"] and "boom" in payload["advance_error"]
+    with pytest.raises(RuntimeError):
+        await start_spec(ctx)
+    (experiment,) = ctx.ledger.list_resources(owner=ctx.owner, kind="experiment")
     assert api.called("POST", "/deployments/runs") == []
-    resumed, _ = await run(ctx, "get_experiment", experiment_id=payload["experiment_id"])
+    resumed, _ = await run(ctx, "get_experiment", experiment_id=experiment.id)
     assert len(api.called("POST", "/deployments/runs")) == 1 and resumed["variants"][0]["deployment_id"]

@@ -1,38 +1,26 @@
-"""Experiments: run one workload against one or more deployment variants and compare the measurements."""
+"""Experiments on Lens Evaluation workflows; legacy ``exp-`` ids are routed to the frozen legacy path."""
 
 from __future__ import annotations
 
-import asyncio
-import re
-import uuid
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .. import evaluation_ops as ops
+from .. import experiments_legacy as legacy
 from ..context import ToolContext
 from ..errors import ToolError
-from ..experiments_deploy import borrowed_target
-from ..experiments_engine import (
-    advance,
-    build_view,
-    delete_experiment,
-    dependents_of_experiment,
-    describe_experiment,
-    initial_state,
-    request_cancel,
-    result_entries,
-    wait_for_change,
-)
-from ..experiments_model import describe_workload
-from ..experiments_plan import ExperimentDesign, check_specs, estimate, normalize
-from ..experiments_results import DEFAULT_COMPARE_METRICS, comparability, compare_entries
+from ..evaluation_design import ExperimentDesign
+from ..evaluation_plan import describe, prepare
+from ..evaluation_results import case_rows, compare, result_view, run_row
+from ..evaluation_view import case_view, poll_after, remaining_seconds, summarize, watch
+from ..experiments_engine import delete_experiment, dependents_of_experiment, describe_experiment
 from ..kinds import register_kind
-from ..ledger import PLAN_TTL_SECONDS, Resource
+from ..lens_api import LensApiError
+from ..path_ids import PathId, check_id
 from ..registry import tool
 
-EXPERIMENT_ID = r"^exp-[a-z0-9]+$"
-RESULT_REF = re.compile(r"^exp-[a-z0-9]+#[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$")
-Include = Literal["results", "comparison", "points", "timeline"]
+Include = Literal["cases", "results", "comparison", "points", "timeline"]
 Metric = Literal[
     "ttft_ms.p50",
     "ttft_ms.p90",
@@ -48,367 +36,278 @@ Metric = Literal[
     "requests_per_s",
     "success_rate",
 ]
+EXPERIMENT_ID = {"min_length": 1, "max_length": 100, "pattern": r"^[A-Za-z0-9][A-Za-z0-9_.-]*$"}
+MAX_WAIT_SECONDS = 50
 
 
 class PlanExperimentInput(ExperimentDesign):
-    """The design; variants is required."""
+    """The experiment design."""
 
 
 class StartExperimentInput(ExperimentDesign):
-    plan_id: str | None = Field(
-        default=None,
-        description="plan_id from plan_experiment: start exactly that design (do not also pass variants). "
-        "Repeating the same plan_id returns the experiment it already started.",
+    expected_digest: str | None = Field(
+        None, description="request_digest from plan_experiment; start fails with plan_stale if the plan changed."
     )
-    client_request_id: str | None = Field(default=None, description="Retry key: repeating it returns the first result.")
+    client_request_id: str | None = Field(
+        None, max_length=64, description="Retry key: repeating it returns the first result."
+    )
 
 
 class GetExperimentInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    experiment_id: str = Field(pattern=EXPERIMENT_ID, description="exp- id from start_experiment.")
+    experiment_id: str = Field(**EXPERIMENT_ID, description="Experiment id returned by start_experiment.")
     include: list[Include] = Field(
         default_factory=list,
-        description="results=compact table per variant and workload; comparison=deltas versus the first variant; "
-        "points=every concurrency/rate point of sweeps; timeline=recent events.",
+        description="cases=every case; results=measurements per plan and scenario; comparison=deltas versus the "
+        "first plan; points=every concurrency/rate point; timeline=case start and finish times.",
     )
-    wait_seconds: int = Field(
-        default=0, ge=0, le=25, description="Long poll: return early when the experiment changes or settles."
-    )
-    wait_until: Literal["change", "settled"] = Field(
-        default="change", description="change=return on any progress; settled=only return when finished."
+    wait_seconds: int = Field(0, ge=0, le=MAX_WAIT_SECONDS, description="Really wait up to this many seconds.")
+    wait_for: Literal["change", "terminal"] = Field(
+        "change", description="change=return when progress changes; terminal=return only when it has finished."
     )
 
 
 class CancelExperimentInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    experiment_id: str = Field(pattern=EXPERIMENT_ID, description="exp- id to cancel.")
-    variant_ids: list[str] | None = Field(
-        default=None, min_length=1, description="Cancel only these variants; default is the whole experiment."
+    experiment_id: str = Field(**EXPERIMENT_ID, description="Experiment to cancel.")
+    case_ids: list[str] | None = Field(
+        None, min_length=1, max_length=50, description="Cancel only these cases; default is the whole experiment."
     )
-    keep_deployments: bool = Field(
-        default=False,
-        description="Whole-experiment cancel only: keep the temporary deployments (they become ordinary deployments "
-        "you must delete). Default: delete them.",
-    )
-    reason: str | None = Field(default=None, max_length=200, description="Why it was cancelled (informational).")
+    reason: str | None = Field(None, max_length=200, description="Why it was cancelled (informational).")
+
+
+class RetryExperimentInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    experiment_id: str = Field(**EXPERIMENT_ID, description="A failed or cancelled experiment.")
 
 
 class CompareResultsInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    result_refs: list[str] = Field(
-        min_length=2,
-        max_length=20,
-        description="Result references (exp-xxxx#variant/workload) from get_experiment(include=['results']).",
+    experiment_ids: list[PathId] = Field(default_factory=list, max_length=10, description="Lens experiment ids.")
+    benchmark_run_ids: list[PathId] = Field(default_factory=list, max_length=50, description="Standalone Lens runs.")
+    baseline: str | None = Field(None, description="Plan label that deltas are computed against; default the first.")
+    metrics: list[Metric] | None = Field(None, description="Default: ttft p99, tpot p99, throughput, success rate.")
+    group_repetitions: bool = Field(True, description="Report the median of repetitions instead of one row each.")
+    result_refs: list[str] | None = Field(
+        None, max_length=20, description="Legacy exp- result references; cannot be combined with the fields above."
     )
-    baseline_ref: str | None = Field(
-        default=None, description="Reference that deltas are computed against; default the first."
-    )
-    metrics: list[Metric] | None = Field(
-        default=None, description="Default: ttft p99, tpot p99, throughput and success rate."
-    )
-    normalize: Literal["none", "per_gpu"] = Field(
-        default="none", description="per_gpu divides throughput by the accelerators each variant used."
-    )
-
-
-def _find_row(ctx: ToolContext, experiment_id: str) -> Resource:
-    row = ctx.ledger.get(experiment_id)
-    if row is None or row.kind != "experiment" or row.state == "deleted":
-        raise ToolError(
-            "not_found",
-            f"No experiment '{experiment_id}'.",
-            field="experiment_id",
-            hint="Call list_resources(kinds=['experiment']) for ids.",
-        )
-    return row
-
-
-def _design_view(design: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "variants": [
-            {
-                key: variant.get(key)
-                for key in ("variant_id", "label", "kind", "deployment_id", "spec", "gpus")
-                if variant.get(key) not in (None, 0)
-            }
-            for variant in design["variants"]
-        ],
-        "workloads": [
-            {"workload_id": w["workload_id"], "preset": w["preset"], "sla": w["sla"], **describe_workload(w)}
-            for w in design["workloads"]
-        ],
-        "rigor": design["rigor"],
-        "repetitions": design["repetitions"],
-        "schedule": design["schedule"],
-        "order": design["order"],
-        "fairness": design["fairness"],
-        "cache_condition": design["cache_condition"],
-        "keep_deployments": design["keep_deployments"],
-    }
+    baseline_ref: str | None = Field(None, description="Legacy: reference deltas are computed against.")
+    normalize: Literal["none", "per_gpu"] = Field("none", description="Legacy: per_gpu divides throughput by gpus.")
 
 
 @tool(
     "plan_experiment",
-    "[R] Validate an experiment design without running anything: variants (a deployment spec the experiment creates "
-    "temporarily, or an existing deployment you own that is only borrowed) x workloads x repetitions. Returns "
-    "accelerator-hours, duration, fairness warnings and a plan_id for start_experiment. Routing-policy or "
-    "other deployment-side ablations are expressed as separate spec variants. Use plan_deployment to check a "
-    "single deployment instead.\n"
-    "Side effects: none; resources: none; duration: synchronous, up to ~25 s (dry-runs each spec variant); "
-    "reversible: n/a.",
+    "[R] Plan an experiment on Lens Evaluation workflows without running anything: every variant is planned with the "
+    "guide planner and rendered, then scenarios x variants x repetitions are expanded into cases. Returns the plans, "
+    "the case order, peak accelerators, an ETA, warnings, the shuffle seed and a request_digest to pass to "
+    "start_experiment as expected_digest. Use plan_deployment for a single deployment.\n"
+    "Side effects: none; resources: none; duration: synchronous, up to ~2 min for many variants; reversible: n/a.",
     PlanExperimentInput,
     read_only=True,
     open_world=True,
 )
 async def plan_experiment(ctx: ToolContext, args: PlanExperimentInput) -> dict[str, Any]:
-    design = await normalize(ctx, args)
-    estimates, checks = await asyncio.gather(estimate(ctx, design), check_specs(ctx, design))
-    errors, warnings = list(estimates["errors"]), list(estimates["warnings"])
-    for check in checks:
-        if check["status"] == "invalid":
-            errors.append({"field": f"variants/{check['variant_id']}/spec", **check["error"]})
-        elif check["status"] == "unchecked":
-            warnings.append(
-                {
-                    "code": "UNCHECKED_PLAN",
-                    "message": f"Variant '{check['variant_id']}' was not dry-run in time; it is planned at start.",
-                }
-            )
-        for warning in check.get("warnings") or []:
-            warnings.append({"code": "VARIANT_WARNING", "variant_id": check["variant_id"], **warning})
-    total_runs = len(design["variants"]) * len(design["workloads"]) * design["repetitions"]
-    result: dict[str, Any] = {
-        "status": "invalid" if errors else "valid_with_warnings" if warnings else "valid",
-        "design": _design_view(design),
-        "benchmark_runs": total_runs,
-        "resources": estimates["resources"],
-        "timing": estimates["timing"],
-        "validation": {"errors": errors, "warnings": warnings},
-        "variant_checks": checks,
-    }
-    if errors:
-        result["next"] = "Fix the errors and call plan_experiment again."
-        return result
-    result["plan_id"] = ctx.ledger.put_plan(
-        owner=ctx.owner,
-        cluster_id=design["cluster_id"],
-        payload={"design": design, "unit_seconds": estimates["unit_seconds"]},
-    )
-    result["expires_in_seconds"] = PLAN_TTL_SECONDS
-    result["next"] = "Call start_experiment(plan_id=...) to run it."
+    prepared = await prepare(ctx, args)
+    result = describe(prepared)
+    result["status"] = "valid_with_warnings" if result["warnings"] else "valid"
+    result["next"] = "Call start_experiment with the same design and expected_digest=request_digest."
     return result
-
-
-def _already_started(ctx: ToolContext, plan_id: str) -> Resource | None:
-    rows = ctx.ledger.list_resources(owner=ctx.owner, kind="experiment", include_deleted=True)
-    return next((row for row in rows if row.meta.get("plan_id") == plan_id), None)
 
 
 @tool(
     "start_experiment",
-    "[S] Start an experiment and return its exp- id immediately. It creates one temporary deployment per spec "
-    "variant (each in its own Lens deployment run), runs the workloads against every variant one benchmark at a "
-    "time, then deletes the temporary deployments; existing-deployment variants are borrowed and never modified "
-    "or deleted. Pass the plan_id from plan_experiment or the same design inline. The benchmark runs server-side; "
-    "progress advances whenever you poll get_experiment. Use cancel_experiment to stop it and "
-    "delete_resources to remove it.\n"
-    "Side effects: creates temporary deployments and Lens benchmark runs; resources: accelerators for each spec "
-    "variant while it runs; duration: returns in seconds, the experiment takes minutes to hours; reversible: "
-    "cancel_experiment.",
+    "[S] Start an experiment as one Lens Evaluation workflow and return immediately; Lens runs it server-side: it "
+    "deploys each variant, runs the scenarios (and optional baselines), and deletes the deployments unless "
+    "preserve_deployment is set. This tool saves one configuration artifact per variant, creates the workflow "
+    "(experiment id = Lens workflow id) and never waits or advances anything; follow it with get_experiment. "
+    "Pass expected_digest from plan_experiment to refuse a changed plan. Stop it with cancel_experiment, rerun a "
+    "failed one with retry_experiment, remove it with delete_resources.\n"
+    "Side effects: creates configuration artifacts and a Lens evaluation workflow that deploys and benchmarks; "
+    "resources: accelerators while it runs; duration: returns in seconds, the experiment takes minutes to hours; "
+    "reversible: cancel_experiment.",
     StartExperimentInput,
     read_only=False,
     open_world=True,
 )
 async def start_experiment(ctx: ToolContext, args: StartExperimentInput) -> dict[str, Any]:
-    plan_id = args.plan_id
-    if plan_id:
-        if args.variants is not None:
-            raise ToolError(
-                "invalid_argument",
-                "Pass either plan_id or a design, not both.",
-                field="plan_id",
-                hint="Call start_experiment(plan_id=...) alone.",
-            )
-        existing = _already_started(ctx, plan_id)
-        if existing is not None:
-            return {"already_started": True, **build_view(existing, [])}
-        plan = ctx.ledger.get_plan(plan_id, ctx.owner)
-        if plan is None:
-            raise ToolError(
-                "plan_not_found",
-                f"Plan '{plan_id}' does not exist or has expired.",
-                field="plan_id",
-                hint="Call plan_experiment again for a fresh plan_id.",
-            )
-        design, unit_seconds = plan["design"], plan["unit_seconds"]
-        for variant in design["variants"]:
-            if variant["kind"] == "existing":
-                await borrowed_target(ctx, variant["deployment_id"])
-    else:
-        design = await normalize(ctx, args)
-        estimates = await estimate(ctx, design)
-        if estimates["errors"]:
-            raise ToolError(
-                "plan_invalid",
-                "; ".join(error["message"] for error in estimates["errors"]),
-                hint="Adjust the design, or call plan_experiment to inspect it.",
-            )
-        unit_seconds = estimates["unit_seconds"]
-    row = ctx.ledger.add_resource(
-        kind="experiment",
-        owner=ctx.owner,
-        cluster_id=design["cluster_id"],
-        name=design["name"] or f"experiment-{uuid.uuid4().hex[:4]}",
-        state="creating",
+    design = ExperimentDesign(**{name: getattr(args, name) for name in ExperimentDesign.model_fields})
+    return await ops.start(ctx, design, args.expected_digest, args.client_request_id)
+
+
+def _not_found(experiment_id: str) -> ToolError:
+    return ToolError(
+        "not_found",
+        f"No experiment '{experiment_id}'.",
+        field="experiment_id",
+        hint="Call list_resources(kinds=['experiment']) for ids.",
     )
-    ctx.ledger.update_meta(row.id, initial_state(row.id, design, plan_id, unit_seconds))
-    ctx.ledger.set_state(row.id, "active")
-    # From here the experiment row exists, so a failed first step must not hide the exp- id: the next poll resumes it.
-    first_step_error = None
+
+
+def _timeline(workflow: dict[str, Any]) -> list[dict[str, Any]]:
+    events = [("created", workflow.get("created_at"), None), ("started", workflow.get("started_at"), None)]
+    for case in workflow.get("cases") or []:
+        events.append(("case_started", case.get("started_at"), case.get("id")))
+        events.append((f"case_{case.get('status')}", case.get("finished_at"), case.get("id")))
+    events.append((str(workflow.get("status")), workflow.get("finished_at"), None))
+    items = [{"at": at, "event": name, **({"case_id": cid} if cid else {})} for name, at, cid in events if at]
+    return sorted(items, key=lambda item: item["at"])
+
+
+async def _details(ctx: ToolContext, experiment_id: str) -> dict[str, Any]:
+    check_id(experiment_id, "experiment_id")
     try:
-        row = (await advance(ctx, row.id))[0] or row
-    except Exception as error:  # noqa: BLE001
-        first_step_error = str(error)[:300]
-        row = ctx.ledger.get(row.id) or row
-    view = {"started": True, **build_view(row, [])}
-    if first_step_error:
-        view["advance_error"] = first_step_error
-        view["next"] = "Call get_experiment to resume the experiment; its state is persisted."
-    return view
+        return await ctx.api.request("GET", f"/evaluate/workflow-runs/{experiment_id}/details", timeout=120)
+    except LensApiError as error:
+        if error.status in (404, 422):
+            raise _not_found(experiment_id) from error
+        raise
+
+
+def _poll_phase(view: dict[str, Any]) -> str:
+    if view.get("status") in ops.TERMINAL:
+        return "terminal"
+    if view.get("status") == "cancelling":
+        return "cancelling"
+    return (view.get("active_case") or {}).get("status") or "queued"
 
 
 @tool(
     "get_experiment",
-    "[R] Progress and results of an experiment. The state has four independent dimensions: execution "
-    "(queued/running/succeeded/partially_succeeded/failed/cancelling/cancelled), measurement (valid runs), "
-    "mechanism (server-side evidence) and cleanup (temporary deployments; residuals are listed if deletion "
-    "failed). include=['results'] gives a table per variant and workload with TTFT, TPOT, ITL, latency, "
-    "throughput and success rate; sweeps are summarised by their highest-throughput point (include 'points' for "
-    "all). Polling also advances the experiment, so keep calling it with wait_seconds=25 until settled. Use "
-    "compare_results to compare across experiments.\n"
-    "Side effects: advances the experiment's own state; resources: none; duration: up to wait_seconds; "
-    "reversible: n/a.",
+    "[R] Status and results of an experiment. Returns status, progress (cases by state), the active case with its "
+    "phase and heartbeat, last_progress_at, a stale verdict with reason, a heuristic ETA and poll_after_seconds. "
+    "wait_seconds (max 50) really waits: wait_for='change' returns when progress changes, 'terminal' only when it "
+    "finishes; the reply says whether it timed out. include=['results'] gives measurements per plan, scenario and "
+    "repetition; 'comparison' adds deltas versus the first plan; 'points' adds every sweep point; 'cases' lists "
+    "every case. Legacy exp- ids are read through the old path. Never changes the experiment.\n"
+    "Side effects: none; resources: none; duration: up to wait_seconds; reversible: n/a.",
     GetExperimentInput,
     read_only=True,
 )
 async def get_experiment(ctx: ToolContext, args: GetExperimentInput) -> dict[str, Any]:
-    row = _find_row(ctx, args.experiment_id)
-    if "phase" not in row.meta:
-        raise ToolError("conflict_state", f"{row.id} is still being created.", hint="Retry in a few seconds.")
-    mine = row.owner == ctx.owner
-    contended = False
-    if mine:
-        advanced, contended = await wait_for_change(ctx, row.id, args.wait_seconds, args.wait_until)
-        row = advanced or row
-    return build_view(row, list(args.include), is_mine=mine, contended=contended)
+    if legacy.is_legacy(args.experiment_id):
+        return await legacy.get(ctx, args.experiment_id, list(args.include), args.wait_seconds, args.wait_for)
+    try:
+        workflow, active, waited, outcome = await watch(ctx, args.experiment_id, args.wait_seconds, args.wait_for)
+    except LensApiError as error:
+        if error.status in (404, 422):
+            raise _not_found(args.experiment_id) from error
+        raise
+    view = summarize(ctx, workflow, active)
+    eta_seconds = await remaining_seconds(ctx, workflow)
+    if eta_seconds is not None:
+        view["eta_remaining_seconds"] = {"value": eta_seconds, "basis": "mcp-heuristic"}
+    view["poll_after_seconds"] = poll_after(_poll_phase(view), eta_seconds)
+    if args.wait_seconds:
+        view.update(waited_seconds=waited, wait_outcome=outcome)
+    include = set(args.include)
+    if "cases" in include:
+        view["cases"] = [case_view(case) for case in workflow.get("cases") or []]
+    if include & {"results", "comparison", "points"}:
+        rows = case_rows(await _details(ctx, args.experiment_id), args.experiment_id)
+        view["results"] = result_view(rows, "points" in include)
+        if "comparison" in include:
+            view["comparison"] = compare(rows, None, None, True)
+    if "timeline" in include:
+        view["timeline"] = _timeline(workflow)
+    return view
 
 
 @tool(
     "cancel_experiment",
-    "[D] Cancel an experiment: stops the running benchmark, waits until Lens reports it terminal, then deletes the "
-    "temporary deployments the experiment created (never borrowed ones). Results already measured are kept. "
-    "Cancelling again is harmless. To remove the experiment record and its Lens benchmark runs as well use "
-    "delete_resources.\n"
-    "Side effects: aborts the benchmark run and deletes temporary deployments; resources: frees their "
-    "accelerators; duration: up to ~20 s, longer teardown continues while you poll get_experiment; "
-    "reversible: no.",
+    "[D] Cancel an experiment through Lens: the running benchmark is stopped and Lens deletes the deployments it "
+    "created; finished measurements are kept. case_ids cancels only those cases. Returns the status, the cancelled "
+    "case ids and the cleanup state (cleanup_pending means call it again). Cancelling a finished experiment is "
+    "harmless. Legacy exp- ids are cancelled through the old path. Only the creator can cancel.\n"
+    "Side effects: aborts running benchmarks and deletes the experiment's deployments; resources: frees their "
+    "accelerators; duration: up to ~2 min while Lens cleans up; reversible: no (retry_experiment reruns).",
     CancelExperimentInput,
     read_only=False,
     destructive=True,
     idempotent=True,
 )
 async def cancel_experiment(ctx: ToolContext, args: CancelExperimentInput) -> dict[str, Any]:
-    row = _find_row(ctx, args.experiment_id)
-    if row.owner != ctx.owner:
-        raise ToolError(
-            "not_owner",
-            f"{row.id} belongs to another user.",
-            field="experiment_id",
-            hint="You can read it with get_experiment but not cancel it.",
-        )
-    unknown = sorted(set(args.variant_ids or []) - set(row.meta["variants"]))
-    if unknown:
-        raise ToolError(
-            "invalid_argument",
-            f"Unknown variant ids: {', '.join(unknown)}.",
-            field="variant_ids",
-            hint="Use the variant_id values shown by get_experiment.",
-        )
-    row = (
-        await request_cancel(
-            ctx, row.id, variant_ids=args.variant_ids, keep_deployments=args.keep_deployments, reason=args.reason
-        )
-        or row
-    )
-    view = build_view(row, ["results"])
-    view["cancelled"] = row.meta["phase"] == "settled"
-    if not view["cancelled"]:
-        view["next"] = "Teardown is still running; call get_experiment to follow it (it finishes while you poll)."
-    return view
+    if legacy.is_legacy(args.experiment_id):
+        return await legacy.cancel(ctx, args.experiment_id, args.reason)
+    return await ops.cancel(ctx, args.experiment_id, args.case_ids)
 
 
-def _entry_for(ctx: ToolContext, ref: str) -> dict[str, Any]:
-    if not RESULT_REF.match(ref):
-        raise ToolError(
-            "invalid_argument",
-            f"'{ref}' is not a result reference.",
-            field="result_refs",
-            hint="Format: exp-xxxxxxxx#variant_id/workload_id.",
-        )
-    row = ctx.ledger.get(ref.split("#", 1)[0])
-    if row is None or row.kind != "experiment" or row.state == "deleted" or "design" not in row.meta:
-        raise ToolError(
-            "not_found",
-            f"No experiment for result reference '{ref}'.",
-            field="result_refs",
-            hint="Use references from get_experiment(include=['results']).",
-        )
-    entry = next((item for item in result_entries(row) if item["result_ref"] == ref), None)
-    if entry is None:
+@tool(
+    "retry_experiment",
+    "[S] Retry a failed or cancelled experiment: Lens requeues its unfinished cases and runs them again with the "
+    "same configuration (finished cases keep their results). Follow it with get_experiment. Only the creator can "
+    "retry; other states return conflict_state.\n"
+    "Side effects: requeues cases and redeploys; resources: accelerators while it runs; duration: returns in "
+    "seconds; reversible: cancel_experiment.",
+    RetryExperimentInput,
+    read_only=False,
+    open_world=True,
+)
+async def retry_experiment(ctx: ToolContext, args: RetryExperimentInput) -> dict[str, Any]:
+    if legacy.is_legacy(args.experiment_id):
         raise ToolError(
             "conflict_state",
-            f"'{ref}' has no finished measurement (yet, or its runs failed).",
-            field="result_refs",
-            hint="Check get_experiment(include=['results']) for the references that exist.",
+            "Legacy exp- experiments cannot be retried.",
+            field="experiment_id",
+            hint="Start a new experiment with start_experiment.",
         )
-    return entry
+    return await ops.retry(ctx, args.experiment_id)
 
 
 @tool(
     "compare_results",
-    "[R] Compare measured results across experiments or within one: deltas of TTFT, TPOT, throughput and success "
-    "rate versus a baseline, with comparability checks (same cluster, model, accelerator type, workload, "
-    "accelerator count, benchmark harness version). Mismatches are reported as issues, not hidden. For one "
-    "experiment's own comparison use get_experiment(include=['comparison']).\n"
+    "[R] Compare measurements across Lens experiments and standalone benchmark runs: median, min, max and the delta "
+    "versus a baseline plan per scenario and concurrency or rate point, with SLA verdicts. Repetitions are "
+    "grouped by default. Legacy exp- result_refs are compared through the old path.\n"
     "Side effects: none; resources: none; duration: synchronous; reversible: n/a.",
     CompareResultsInput,
     read_only=True,
 )
 async def compare_results(ctx: ToolContext, args: CompareResultsInput) -> dict[str, Any]:
-    refs = list(dict.fromkeys(args.result_refs))
-    if len(refs) < 2:
-        raise ToolError("invalid_argument", "Pass at least two different result references.", field="result_refs")
-    baseline = args.baseline_ref or refs[0]
-    if baseline not in refs:
+    if args.result_refs:
+        if args.experiment_ids or args.benchmark_run_ids:
+            raise ToolError(
+                "invalid_argument",
+                "result_refs cannot be combined with experiment_ids or benchmark_run_ids.",
+                field="result_refs",
+            )
+        return legacy.compare(ctx, args.result_refs, args.baseline_ref, args.metrics, args.normalize)
+    if not args.experiment_ids and not args.benchmark_run_ids:
         raise ToolError(
             "invalid_argument",
-            "baseline_ref must be one of result_refs.",
-            field="baseline_ref",
-            hint="Add the baseline to result_refs or pick one of them.",
+            "Pass experiment_ids or benchmark_run_ids.",
+            field="experiment_ids",
+            hint="Use ids from start_experiment or list_resources(kinds=['experiment']).",
         )
-    entries = [_entry_for(ctx, ref) for ref in refs]
-    per_gpu = args.normalize == "per_gpu"
-    return {
-        "comparability": comparability(entries, per_gpu),
-        "comparison": compare_entries(entries, baseline, list(args.metrics or DEFAULT_COMPARE_METRICS), per_gpu),
-        "results": [
-            {key: entry[key] for key in ("result_ref", "label", "metrics", "repetitions", "gpus", "sla")}
-            for entry in entries
-        ],
-    }
+    rows: list[dict[str, Any]] = []
+    for experiment_id in dict.fromkeys(args.experiment_ids):
+        if legacy.is_legacy(experiment_id):
+            raise ToolError(
+                "invalid_argument",
+                f"'{experiment_id}' is a legacy experiment; pass its result_refs instead.",
+                field="experiment_ids",
+            )
+        rows += case_rows(await _details(ctx, experiment_id), experiment_id)
+    for run_id in dict.fromkeys(args.benchmark_run_ids):
+        try:
+            run = await ctx.api.request("GET", f"/evaluate/runs/{run_id}", timeout=60)
+        except LensApiError as error:
+            if error.status in (404, 422):
+                raise ToolError("not_found", f"No benchmark run '{run_id}'.", field="benchmark_run_ids") from error
+            raise
+        rows.append({**run_row(run), "source": run_id})
+    comparison = compare(rows, args.baseline, list(args.metrics or []) or None, args.group_repetitions)
+    if comparison.get("error"):
+        raise ToolError(
+            "invalid_argument",
+            f"Baseline '{args.baseline}' is not among the compared plans.",
+            field="baseline",
+            hint=f"Plans: {', '.join(comparison['plans'])}.",
+        )
+    return {"comparison": comparison, "results": result_view(rows, False)}
 
 
 register_kind("experiment", delete=delete_experiment, describe=describe_experiment, dependents=dependents_of_experiment)

@@ -6,11 +6,13 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from .. import evaluation_ops
 from ..context import ToolContext
 from ..errors import ToolError
 from ..kinds import all_kinds, handler_for
 from ..ledger import KIND_PREFIXES, Resource
 from ..lens_api import LensApiError
+from ..path_ids import PathId
 from ..registry import tool
 
 Kind = Literal["deployment", "experiment", "model_cache", "storage_volume", "model_service", "simulation"]
@@ -81,15 +83,33 @@ async def list_resources(ctx: ToolContext, args: ListResourcesInput) -> dict[str
             entries.extend(
                 item for item in await handler.list_others(ctx, args.cluster_id) if item.get("lens_id") not in owned
             )
+    if "experiment" in kinds:
+        try:
+            entries.extend(await evaluation_ops.list_experiments(ctx, args.cluster_id, args.owner))
+        except (LensApiError, TimeoutError) as error:
+            entries.append({"kind": "experiment", "live_status_error": getattr(error, "message", None) or str(error)})
     return {"resources": entries, "count": len(entries)}
+
+
+class ResourceRef(BaseModel):
+    kind: Literal["experiment"] = Field(description="Resources that live only in Lens, such as evaluation workflows.")
+    id: PathId
 
 
 class DeleteResourcesInput(BaseModel):
     ids: list[str] = Field(
-        ..., min_length=1, max_length=50, description="Explicit resource ids, for example dep-1a2b3c4d."
+        default_factory=list, max_length=50, description="Explicit resource ids, for example dep-1a2b3c4d."
+    )
+    items: list[ResourceRef] = Field(
+        default_factory=list,
+        max_length=20,
+        description="Lens experiments (evaluation workflows) as {kind: 'experiment', id}. A finished experiment "
+        "is deleted with its deployment runs, benchmark history and saved configurations.",
     )
     expected_names: list[str] | None = Field(
-        None, description="Optional names, one per id; nothing is deleted if any name does not match its id."
+        None,
+        description="Optional names, one per id followed by one per item; nothing is deleted if any name does "
+        "not match its id.",
     )
     cascade: bool = Field(
         False,
@@ -101,8 +121,10 @@ class DeleteResourcesInput(BaseModel):
 
 @tool(
     "delete_resources",
-    "[D] Permanently delete resources you created, by explicit id (1-50). Reports per id: deleted, blocked "
-    "(still in use, protected), not_found or failed; one failure does not stop the others. Resources you did not "
+    "[D] Permanently delete resources you created, by explicit id (1-50) or, for Lens experiments, items "
+    "[{kind:'experiment', id}] (a terminal experiment is removed with its deployment runs and history). Reports "
+    "per id: deleted, blocked (still in use, protected), not_found or failed; one failure does not stop the "
+    "others. Resources you did not "
     "create are refused. Use list_resources(include=['dependents']) first to see what would block. To only "
     "free GPUs and keep the record use stop_deployment instead.\n"
     "Side effects: removes Kubernetes objects and Lens records; resources: frees accelerators/disk; "
@@ -113,8 +135,12 @@ class DeleteResourcesInput(BaseModel):
     idempotent=True,
 )
 async def delete_resources(ctx: ToolContext, args: DeleteResourcesInput) -> dict[str, Any]:
-    if args.expected_names is not None and len(args.expected_names) != len(args.ids):
-        raise ToolError("invalid_argument", "expected_names must have one entry per id.", field="expected_names")
+    if not args.ids and not args.items:
+        raise ToolError("invalid_argument", "Pass ids or items.", field="ids", hint="Use ids from list_resources.")
+    if args.expected_names is not None and len(args.expected_names) != len(args.ids) + len(args.items):
+        raise ToolError(
+            "invalid_argument", "expected_names must have one entry per id and per item.", field="expected_names"
+        )
     rows: dict[str, Resource | None] = {resource_id: ctx.ledger.get(resource_id) for resource_id in args.ids}
     for index, resource_id in enumerate(args.ids):
         row = rows[resource_id]
@@ -125,7 +151,13 @@ async def delete_resources(ctx: ToolContext, args: DeleteResourcesInput) -> dict
                 field="expected_names",
                 hint="Re-run list_resources and pass the ids and names you actually mean.",
             )
+    item_names = (args.expected_names or [])[len(args.ids) :]
+    items = {ref.id: name for ref, name in zip(args.items, item_names, strict=False)}
+    for item_id, expected in items.items():
+        await evaluation_ops.expect_name(ctx, item_id, expected)
     results = [await _delete_one(ctx, resource_id, rows[resource_id], args.cascade) for resource_id in args.ids]
+    for item_id in dict.fromkeys(ref.id for ref in args.items):
+        results.append(await evaluation_ops.delete(ctx, item_id))
     return {
         "results": results,
         "deleted": [item["id"] for item in results if item["status"] == "deleted"],
