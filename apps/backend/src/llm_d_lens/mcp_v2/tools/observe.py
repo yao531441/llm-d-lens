@@ -34,7 +34,7 @@ NEXT_BY_STATUS = {
     "starting": "Call get_deployment(wait_seconds=25) until ready; diagnose_deployment if it stalls.",
     "ready": "Verify it with test_deployment, then send requests to the endpoint.",
     "failed": "Call diagnose_deployment for the cause.",
-    "stopped": "restart_deployment brings it back; delete_resources removes it.",
+    "stopped": "create_deployment(from_deployment_id=...) makes a fresh copy; delete_resources removes it.",
     "stopping": "Call get_deployment(wait_seconds=25) until it is stopped.",
 }
 
@@ -51,7 +51,7 @@ class GetDeploymentArgs(BaseModel):
     )
     include: list[Literal["restart_check"]] = Field(
         default_factory=list,
-        description="'restart_check' adds whether the accelerators needed by restart_deployment are free.",
+        description="'restart_check' adds whether the accelerators a fresh copy of this deployment needs are free.",
     )
 
 
@@ -103,8 +103,7 @@ async def _restart_check(ctx: ToolContext, status: str, cluster_id: str | None, 
         "accelerators_free": free,
         "fits_now": fits,
         "restart_available": False,
-        "note": "restart_deployment is unavailable while Lens restart is broken; use create_deployment("
-        "from_deployment_id=...) for a new copy.",
+        "note": "In-place restart is unavailable; use create_deployment(from_deployment_id=...) for a new copy.",
     }
 
 

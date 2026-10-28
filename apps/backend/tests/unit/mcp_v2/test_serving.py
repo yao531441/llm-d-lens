@@ -1,3 +1,5 @@
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 from llm_d_lens.mcp_v2.context import ToolContext
@@ -100,6 +102,8 @@ class Gateway:
             "selectionPolicy": "random",
             "description": body["description"],
             "updatedAt": "t0",
+            "ownerUserId": "user-a",
+            "createdAt": datetime.now(UTC).isoformat(),
         }
         self.members = [self.member(body["executionId"])]
         return self.group
@@ -562,3 +566,70 @@ async def test_saved_but_not_routed_publish_still_binds_the_service(api, ctx, le
     payload, is_error = await call_tool(ctx, "publish_model_service", {"public_name": "qwen", "deployment_ids": [dep]})
     assert not is_error and payload["warnings"]
     assert ctx.ledger.get(payload["service_id"]).lens_execution_id == "msg-1"
+
+
+def age(ctx, row, seconds):
+    ctx.ledger._write("UPDATE resources SET created_at = created_at - ? WHERE id = ?", (seconds, row.id))
+
+
+def pending_service(ctx):
+    return ctx.ledger.add_resource(kind="model_service", owner="user-a", cluster_id="c1", name="qwen", state="creating")
+
+
+def foreign_group(lens, **override):
+    lens.publish(None, {"name": "qwen", "clusterId": "c1", "executionId": "exec-9", "description": ""})
+    lens.group.update(override)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"ownerUserId": "bob"},
+        {"ownerUserId": None},
+        {"createdAt": (datetime.now(UTC) - timedelta(hours=2)).isoformat()},
+        {"createdAt": None},
+    ],
+    ids=["other-owner", "no-owner", "created-before-the-row", "no-timestamp"],
+)
+async def test_same_name_service_that_is_not_ours_is_never_claimed(api, ctx, lens, override):
+    row = pending_service(ctx)
+    foreign_group(lens, **override)
+    payload, is_error = await call_tool(ctx, "get_model_service", {"service_id": row.id})
+    assert is_error and payload["error"]["code"] == "conflict_state"
+    assert ctx.ledger.get(row.id).lens_execution_id is None
+    done, _ = await call_tool(ctx, "delete_resources", {"ids": [row.id]})
+    assert done["results"][0]["status"] == "blocked" and lens.group is not None
+
+
+@pytest.mark.asyncio
+async def test_service_already_bound_to_another_row_is_not_claimed(api, ctx, lens):
+    foreign_group(lens)
+    ctx.ledger.add_resource(
+        kind="model_service", owner="user-a", cluster_id="c1", name="old", lens_execution_id="msg-1"
+    )
+    row = pending_service(ctx)
+    payload, is_error = await call_tool(ctx, "get_model_service", {"service_id": row.id})
+    assert is_error and ctx.ledger.get(row.id).lens_execution_id is None
+
+
+@pytest.mark.asyncio
+async def test_expired_pending_service_row_reports_how_to_clear_it_and_can_be_deleted(api, ctx, lens):
+    row = pending_service(ctx)
+    foreign_group(lens)
+    age(ctx, row, 700)
+    payload, is_error = await call_tool(ctx, "get_model_service", {"service_id": row.id})
+    assert is_error and payload["error"]["code"] == "conflict_state"
+    assert "delete_resources" in payload["error"]["hint"] and row.id in payload["error"]["hint"]
+    done, _ = await call_tool(ctx, "delete_resources", {"ids": [row.id]})
+    assert done["deleted"] == [row.id] and lens.group is not None  # the other user's service is untouched
+    assert ctx.ledger.get(row.id).state == "deleted"
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_fresh_pending_service_row_is_blocked_as_in_use(api, ctx, lens):
+    row = pending_service(ctx)
+    done, _ = await call_tool(ctx, "delete_resources", {"ids": [row.id]})
+    result = done["results"][0]
+    assert result["status"] == "blocked" and result["error"] == "in_use"
+    assert ctx.ledger.get(row.id).state == "creating"

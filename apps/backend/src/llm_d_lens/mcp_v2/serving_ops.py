@@ -10,6 +10,7 @@ from .errors import ToolError
 from .kinds import register_kind
 from .ledger import Resource
 from .lens_api import LensApiError
+from .reconcile_rules import CLAIM_WINDOW_SECONDS, claim_expired, may_claim, row_age
 from .serving_view import connection_examples, is_routable, service_status, service_view
 
 ADMIN = "/model-service/admin"
@@ -46,7 +47,7 @@ def outcome_unknown(row: Resource, error: BaseException) -> ToolError:
 
 async def reconcile_service(ctx: ToolContext, row: Resource) -> Resource:
     """Bind an unconfirmed ledger row to the Lens group with its name, if Lens has one."""
-    if row.lens_execution_id or row.state not in ("creating", "deleting"):
+    if row.lens_execution_id or row.state not in ("creating", "deleting") or claim_expired(row):
         return row
     try:
         groups = (await ctx.api.request("GET", f"{ADMIN}/groups")).get("items") or []
@@ -56,12 +57,23 @@ async def reconcile_service(ctx: ToolContext, row: Resource) -> Resource:
         same = (
             group.get("clusterId") == row.cluster_id and str(group.get("name", "")).lower() == (row.name or "").lower()
         )
-        if same and group.get("ownerUserId") in (None, ctx.owner):
+        # a same-name group made by someone else, or before/long after this publish, is never ours
+        if same and group.get("ownerUserId") == ctx.owner and may_claim(ctx, row, group):
             ctx.ledger.bind_execution(row.id, group["id"])
             if row.state == "creating":
                 ctx.ledger.set_state(row.id, "active")
             return ctx.ledger.get(row.id) or row
     return row
+
+
+def pending_in_use(row: Resource) -> ToolError:
+    wait = max(1, round(CLAIM_WINDOW_SECONDS - row_age(row)))
+    return ToolError(
+        "in_use",
+        f"The publish of '{row.name}' is still unconfirmed and may yet complete in Lens.",
+        hint=f"Call get_model_service(service_id='{row.id}') to reconcile it; if nothing appears, "
+        f"delete_resources will clear the record in about {wait} seconds.",
+    )
 
 
 def service_not_found(service_id: str) -> ToolError:
@@ -86,7 +98,12 @@ async def resolve_service(ctx: ToolContext, service_id: str) -> ServiceRef:
                 "conflict_state",
                 f"{service_id} was being published but Lens has not confirmed it, so it may not exist.",
                 field="service_id",
-                hint="Retry shortly. If it stays unconfirmed, remove the record with delete_resources.",
+                hint=(
+                    "Retry shortly."
+                    if not claim_expired(row)
+                    else f"No matching service appeared within {CLAIM_WINDOW_SECONDS // 60} minutes; "
+                    "remove the record with delete_resources(ids=['" + service_id + "'])."
+                ),
             )
         if row.owner != ctx.owner:
             return ServiceRef(None, row.lens_execution_id, foreign_owner=True)
@@ -258,6 +275,8 @@ async def delete(ctx: ToolContext, row: Resource, cascade: bool) -> None:
     row = await reconcile_service(ctx, row)
     group_id = row.lens_execution_id
     if not group_id:
+        if not claim_expired(row):
+            raise pending_in_use(row)
         return
     try:
         members = (await ctx.api.request("GET", f"{ADMIN}/members", params={"group_id": group_id})).get("items") or []

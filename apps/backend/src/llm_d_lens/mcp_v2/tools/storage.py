@@ -115,7 +115,16 @@ async def create_storage_volume(ctx: ToolContext, args: CreateVolumeArgs) -> dic
         cluster_id=args.cluster_id,
         name=args.name,
         state="creating",
-        meta={"created_via": CREATED_VIA, "expires_at": time.time() + args.ttl_hours * 3600},
+        meta={
+            "created_via": CREATED_VIA,
+            "expires_at": time.time() + args.ttl_hours * 3600,
+            "request": {
+                "kind": args.kind,
+                "capacity": f"{args.capacity_gib}Gi",
+                "path": path,
+                "server": args.nfs_server if args.kind == "nfs" else None,
+            },
+        },
     )
     try:
         volume = await ctx.api.request(

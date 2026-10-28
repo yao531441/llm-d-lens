@@ -242,6 +242,61 @@ async def test_unconfirmed_create_that_never_appears_in_lens_is_dropped_after_th
     assert got["status"] == "deleted" and ctx.ledger.get(deployment_id).state == "deleted"
 
 
+async def unconfirmed_create(api, ctx) -> str:
+    plan_routes(api)
+    api.on("POST", "/deployments/runs", TimeoutError())
+    payload, _ = await call_tool(ctx, "create_deployment", {"spec": SPEC})
+    return payload["error"]["deployment_id"]
+
+
+@pytest.mark.asyncio
+async def test_delete_of_an_unconfirmed_create_waits_then_reconciles_the_run(api, ctx, monkeypatch):
+    deployment_id = await unconfirmed_create(api, ctx)
+    api.on("GET", "/deployments/runs", [])
+    payload, _ = await call_tool(ctx, "delete_resources", {"ids": [deployment_id]})
+    (result,) = payload["results"]
+    assert result["status"] == "blocked" and result["error"] == "in_use"
+    assert ctx.ledger.get(deployment_id).state == "creating"
+
+    # Lens did create the run after all: the delete must remove it instead of just marking the row deleted.
+    api.on("GET", "/deployments/runs", [{"id": "run-9", "provenance": {"ledger_id": deployment_id}}])
+    api.on("GET", "/deployments/runs/run-9", {"id": "run-9", "cases": [lens_case("deploying", None)]})
+    api.on("DELETE", "/deployments/runs/run-9", {})
+    payload, _ = await call_tool(ctx, "delete_resources", {"ids": [deployment_id]})
+    assert payload["results"][0]["status"] == "deleted"
+    assert len(api.called("DELETE", "/deployments/runs/run-9")) == 1
+    assert ctx.ledger.get(deployment_id).state == "deleted"
+
+
+@pytest.mark.asyncio
+async def test_delete_of_an_unconfirmed_create_after_the_grace_period_just_drops_the_row(api, ctx, monkeypatch):
+    deployment_id = await unconfirmed_create(api, ctx)
+    api.on("GET", "/deployments/runs", [])
+    monkeypatch.setattr(deployment_refs, "CREATE_GRACE_SECONDS", -1)
+    payload, _ = await call_tool(ctx, "delete_resources", {"ids": [deployment_id]})
+    assert payload["results"][0]["status"] == "deleted"
+    assert api.called("DELETE", "/deployments/runs/run-9") == []
+    assert ctx.ledger.get(deployment_id).state == "deleted"
+
+
+@pytest.mark.asyncio
+async def test_experiment_launched_rows_are_left_to_the_experiment_engine(api, ctx, monkeypatch):
+    row = ctx.ledger.add_resource(
+        kind="deployment",
+        owner=ctx.owner,
+        cluster_id="c1",
+        name="v1",
+        root_id="exp-1",
+        state="creating",
+        meta={"spec": SPEC, "experiment_id": "exp-1"},
+    )
+    api.on("GET", "/deployments/runs", [])
+    monkeypatch.setattr(deployment_refs, "CREATE_GRACE_SECONDS", -1)
+    got, _ = await call_tool(ctx, "get_deployment", {"deployment_id": row.id})
+    assert got["status"] == "pending" and ctx.ledger.get(row.id).state == "creating"
+    assert api.called("GET", "/deployments/runs") == []
+
+
 @pytest.mark.asyncio
 async def test_cancelled_create_leaves_the_row_creating(api, ctx):
     plan_routes(api)

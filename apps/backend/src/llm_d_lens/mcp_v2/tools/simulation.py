@@ -15,6 +15,7 @@ from ..registry import tool
 from ..simulation_target import resolve_target
 from ..simulation_view import (
     ACTIVE,
+    adopt_unbound,
     delete_simulation,
     describe_simulation,
     estimate_replay,
@@ -329,19 +330,9 @@ def _outcome_unknown(simulation_id: str) -> ToolError:
 
 
 async def _adopt_unbound(ctx: ToolContext, simulation_id: str) -> None:
-    """Link a ``creating`` record to its Lens task when the create response was lost (single exact name match only)."""
     row = ctx.ledger.get(simulation_id) if simulation_id.startswith("sim-") else None
-    if row is None or row.kind != "simulation" or row.owner != ctx.owner or row.lens_execution_id:
-        return
-    page = await ctx.api.request("GET", "/simulation/tasks", params={"limit": 100})
-    candidates = [
-        task
-        for task in page.get("tasks") or []
-        if task.get("name") == row.name and ctx.ledger.find_by_execution(task["id"]) is None
-    ]
-    if len(candidates) == 1:
-        ctx.ledger.bind_execution(row.id, candidates[0]["id"])
-        ctx.ledger.set_state(row.id, "active")
+    if row is not None and row.owner == ctx.owner:
+        await adopt_unbound(ctx, row)
 
 
 def _resolve_simulation(ctx: ToolContext, simulation_id: str) -> tuple[str, bool, str | None]:

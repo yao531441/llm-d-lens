@@ -346,6 +346,37 @@ async def test_delete_resources_stops_then_deletes_simulation_and_is_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_delete_unconfirmed_simulation_adopts_waits_for_grace_then_removes(api, sim_ctx, monkeypatch):
+    monkeypatch.setattr(simulation_view, "POLL_SECONDS", 0.01)
+    sim = sim_ctx.ledger.add_resource(
+        kind="simulation", owner=sim_ctx.owner, cluster_id="c1", name="replay-1", state="creating"
+    )
+    api.on("GET", "/simulation/tasks", {"tasks": []})
+    payload, _ = await call_tool(sim_ctx, "delete_resources", {"ids": [sim.id]})
+    assert payload["results"][0]["error"] == "in_use" and sim_ctx.ledger.get(sim.id).state == "creating"
+    assert api.called("DELETE", "/simulation/tasks/ab12cd34") == []
+
+    started = {"id": "ab12cd34", "name": "replay-1", "status": "running"}
+    api.on("GET", "/simulation/tasks", {"tasks": [started]})
+    states = itertools.chain([{"status": "running"}], itertools.repeat({"status": "cancelled"}))
+    api.on("GET", "/simulation/tasks/ab12cd34", lambda params, body: next(states))
+    api.on("POST", "/simulation/tasks/ab12cd34/stop", {"status": "cancelling"})
+    api.on("DELETE", "/simulation/tasks/ab12cd34", {"deleted": True})
+    payload, _ = await call_tool(sim_ctx, "delete_resources", {"ids": [sim.id]})
+    assert payload["deleted"] == [sim.id]
+    assert len(api.called("POST", "/simulation/tasks/ab12cd34/stop")) == 1
+    assert len(api.called("DELETE", "/simulation/tasks/ab12cd34")) == 1
+
+    old = sim_ctx.ledger.add_resource(
+        kind="simulation", owner=sim_ctx.owner, cluster_id="c1", name="replay-2", state="creating"
+    )
+    monkeypatch.setattr(simulation_view, "CREATE_GRACE_SECONDS", -1)
+    api.on("GET", "/simulation/tasks", {"tasks": []})
+    payload, _ = await call_tool(sim_ctx, "delete_resources", {"ids": [old.id]})
+    assert payload["deleted"] == [old.id]
+
+
+@pytest.mark.asyncio
 async def test_list_resources_shows_simulations_of_others_read_only(api, sim_ctx):
     api.on(
         "GET",

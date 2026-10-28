@@ -40,7 +40,7 @@ LOG_RULES = (
     (
         "model_download_failed",
         "The model download failed on the network.",
-        "Check cluster egress/proxy; retry with restart_deployment, or pre-load the model into a cache.",
+        "Check cluster egress/proxy, pre-load the model into a cache, then create_deployment(from_deployment_id=...).",
         re.compile(r"Max retries exceeded|Connection (error|reset|refused|timed out)|Temporary failure in name", re.I),
     ),
     (
@@ -117,7 +117,7 @@ def _pod_findings(pod: dict[str, Any], status: str, events: str) -> list[dict[st
                 "critical",
                 "A container was killed for exceeding its memory limit.",
                 facts,
-                "Lower spec.engine.max_model_len or raise tensor_parallel_size; then restart_deployment.",
+                "Lower max_model_len or raise tensor_parallel_size, then create_deployment(from_deployment_id=...).",
             )
         )
     elif reason == "CrashLoopBackOff" or (pod["restarts"] >= 3 and not pod["ready"]):

@@ -260,10 +260,10 @@ def _conflict(error: LensApiError, hint: str) -> ToolError:
 @tool(
     "stop_deployment",
     "[D] Scale a deployment you created down to zero so its accelerators are free; the Lens record, namespace and "
-    "spec are kept and restart_deployment brings it back. Interrupts all traffic to it. To remove it entirely use "
-    "delete_resources.\n"
+    "spec are kept; create_deployment(from_deployment_id=...) makes a fresh copy later. Interrupts all traffic to it. "
+    "To remove it entirely use delete_resources.\n"
     "Side effects: stops all model-server pods; resources: frees the deployment's accelerators; "
-    "duration: synchronous, seconds; reversible: yes (restart_deployment).",
+    "duration: synchronous, seconds; reversible: no in place (create_deployment from_deployment_id).",
     DeploymentIdArgs,
     read_only=False,
     destructive=True,

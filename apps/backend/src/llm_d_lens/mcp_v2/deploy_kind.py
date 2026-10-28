@@ -6,7 +6,7 @@ from typing import Any
 
 from .context import ToolContext
 from .deploy_status import fetch_execution, public_status
-from .deployment_refs import get_run, latest_case, resolve
+from .deployment_refs import get_run, latest_case, resolve, within_create_grace
 from .errors import ToolError
 from .ledger import Resource
 from .lens_api import LensApiError
@@ -70,6 +70,18 @@ async def delete(ctx: ToolContext, row: Resource, cascade: bool) -> None:
     if users := await borrowers(ctx, row):
         raise borrowed_error(row.id, users)
     ref = await resolve(ctx, row.id)
+    if not ref.run_id and not ref.execution_id:
+        current = ctx.ledger.get(row.id) or row
+        if current.state == "deleted":
+            return
+        if within_create_grace(current):
+            raise ToolError(
+                "in_use",
+                "The create request was not confirmed by Lens yet, so there is nothing safe to delete; wait a few "
+                "minutes and delete again.",
+                hint="Call get_deployment, then retry delete_resources later.",
+            )
+        return
     try:
         if ref.execution_id:
             try:

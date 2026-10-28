@@ -82,18 +82,33 @@ async def run_execution_id(ctx: ToolContext, run_id: str) -> str | None:
     return (case or {}).get("execution_id")
 
 
+def belongs_to_experiment(row: Resource) -> bool:
+    """Experiment-launched deployments are reconciled (and retried) by the experiment engine, not here."""
+    return bool(row.meta.get("experiment_id")) or row.root_id.startswith("exp-")
+
+
+def unconfirmed(row: Resource) -> bool:
+    """A row whose Lens run is not known yet: created or being deleted before Lens confirmed the create."""
+    return row.state in ("creating", "deleting") and not row.lens_run_id
+
+
+def within_create_grace(row: Resource) -> bool:
+    return time.time() - row.created_at <= CREATE_GRACE_SECONDS
+
+
 async def reconcile_creating(ctx: ToolContext, row: Resource) -> Resource:
-    """Rows left in 'creating' by an unconfirmed create: bind the Lens run that carries their ledger_id."""
+    """Rows left unconfirmed by an unconfirmed create: bind the Lens run that carries their ledger_id."""
     try:
         runs = await ctx.api.request("GET", "/deployments/runs")
-    except Exception:  # noqa: BLE001  (best effort; the row stays 'creating' and is retried on the next read)
+    except Exception:  # noqa: BLE001  (best effort; the row stays as it is and is retried on the next read)
         return row
     items = runs if isinstance(runs, list) else (runs or {}).get("items") or []
     match = next((run for run in items if (run.get("provenance") or {}).get("ledger_id") == row.id), None)
     if match:
         ctx.ledger.bind_run(row.id, match["id"])
-        ctx.ledger.set_state(row.id, "active")
-    elif time.time() - row.created_at > CREATE_GRACE_SECONDS:
+        if row.state == "creating":
+            ctx.ledger.set_state(row.id, "active")
+    elif not within_create_grace(row):
         ctx.ledger.set_state(row.id, "deleted")
     return ctx.ledger.get(row.id) or row
 
@@ -111,7 +126,7 @@ async def resolve(ctx: ToolContext, deployment_id: str) -> DeploymentRef:
             row, foreign = None, True
     if row is None:
         return DeploymentRef(None, deployment_id, None, foreign_owner=foreign)
-    if row.state == "creating" and not row.lens_run_id:
+    if unconfirmed(row) and not belongs_to_experiment(row):
         row = await reconcile_creating(ctx, row)
     execution_id = row.lens_execution_id
     previous = row.meta.get("restarting_from")

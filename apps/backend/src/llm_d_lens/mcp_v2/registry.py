@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -19,7 +20,7 @@ from .safety import find_secret, redact
 PROFILES = ("core", "serving", "storage", "simulation", "cluster-admin", "lens-settings")
 DESTRUCTIVE_PER_HOUR = int(os.environ.get("LENS_MCP_V2_DESTRUCTIVE_PER_HOUR", "100"))
 
-_IN_FLIGHT: set[tuple[str, str, str]] = set()
+IN_FLIGHT_LEASE_SECONDS = 120
 
 Handler = Callable[[ToolContext, Any], Awaitable[dict[str, Any]]]
 
@@ -132,6 +133,8 @@ async def _dispatch(ctx: ToolContext, name: str, arguments: dict[str, Any]) -> t
         ).payload(), True
     replay_key = None
     claimed = None
+    fingerprint = None
+    holder = uuid.uuid4().hex
     try:
         args = spec.input_model.model_validate(arguments or {})
         secret = find_secret(arguments or {})
@@ -157,18 +160,18 @@ async def _dispatch(ctx: ToolContext, name: str, arguments: dict[str, Any]) -> t
                             field="client_request_id",
                             hint="Use a new client_request_id for a different request.",
                         )
-                    _audit(ctx, spec, arguments, False, "idempotent replay")
-                    return {**cached["result"], "meta": {"idempotent_replay": True}}, False
-                inflight_key = (ctx.owner, name, replay_key)
-                if inflight_key in _IN_FLIGHT:
+                    cached_failed = bool(cached.get("is_error"))
+                    _audit(ctx, spec, arguments, cached_failed, "idempotent replay")
+                    return {**cached["result"], "meta": {"idempotent_replay": True}}, cached_failed
+                lease_key = f"idem:{ctx.owner}:{name}:{replay_key}"
+                if not ctx.ledger.acquire_lease(lease_key, holder, IN_FLIGHT_LEASE_SECONDS):
                     raise ToolError(
                         "conflict_state",
                         "A request with this client_request_id is still running.",
                         field="client_request_id",
                         hint="Wait for it to finish, then retry with the same client_request_id to get its result.",
                     )
-                _IN_FLIGHT.add(inflight_key)
-                claimed = inflight_key
+                claimed = lease_key
             if spec.destructive:
                 weight = max(1, len(ids)) if isinstance(ids := getattr(args, "ids", None), list) else 1
                 if ctx.ledger.count_actions(ctx.owner, "destructive") + weight > DESTRUCTIVE_PER_HOUR:
@@ -180,13 +183,23 @@ async def _dispatch(ctx: ToolContext, name: str, arguments: dict[str, Any]) -> t
                 ctx.ledger.record_action(ctx.owner, "destructive", weight)
         result = await spec.handler(ctx, args)
         if replay_key:
-            ctx.ledger.put_idempotent(ctx.owner, name, replay_key, {"_fingerprint": fingerprint, "result": result})
+            ctx.ledger.put_idempotent(
+                ctx.owner, name, replay_key, {"_fingerprint": fingerprint, "result": result, "is_error": False}
+            )
         _audit(ctx, spec, arguments, False, None)
         return result, False
     except ValidationError as error:
         failure = _validation_error(error)
     except ToolError as error:
         failure = error
+        # An uncertain create may have produced a resource; replays must return the same id, not create another.
+        if replay_key and fingerprint and error.code == "upstream_unavailable" and _names_a_resource(error):
+            ctx.ledger.put_idempotent(
+                ctx.owner,
+                name,
+                replay_key,
+                {"_fingerprint": fingerprint, "result": error.payload(), "is_error": True},
+            )
     except LensApiError as error:
         failure = upstream_error(error)
     except Exception as error:  # noqa: BLE001 - never leak an unstructured failure to the agent
@@ -196,7 +209,8 @@ async def _dispatch(ctx: ToolContext, name: str, arguments: dict[str, Any]) -> t
             hint="The operation may or may not have completed. Re-check with the matching get_* tool before retrying.",
         )
     finally:
-        _IN_FLIGHT.discard(claimed)
+        if claimed:
+            ctx.ledger.release_lease(claimed, holder)
     _audit(ctx, spec, arguments, True, failure.message)
     return failure.payload(), True
 
@@ -204,3 +218,7 @@ async def _dispatch(ctx: ToolContext, name: str, arguments: dict[str, Any]) -> t
 def _audit(ctx: ToolContext, spec: ToolSpec, arguments: dict[str, Any], is_error: bool, summary: str | None) -> None:
     if not spec.read_only:
         ctx.ledger.audit(ctx.owner, spec.name, redact(arguments or {}), is_error, summary)
+
+
+def _names_a_resource(error: ToolError) -> bool:
+    return any(key.endswith("_id") for key in error.extra)

@@ -170,3 +170,27 @@ async def test_unexpected_delete_failures_are_reported_per_id_and_stay_retryable
     payload, is_error = await call_tool(ctx, "delete_resources", {"ids": [row.id]})
     assert not is_error and payload["results"][0]["error"] == "upstream_unavailable"
     assert ctx.ledger.get(row.id).state == "active"
+
+
+@pytest.mark.asyncio
+async def test_uncertain_create_is_replayed_instead_of_repeated(ctx, monkeypatch):
+    from pydantic import BaseModel
+
+    from llm_d_lens.mcp_v2 import registry
+
+    class Args(BaseModel):
+        client_request_id: str | None = None
+
+    calls = []
+
+    async def handler(c, a):
+        calls.append(1)
+        raise ToolError("upstream_unavailable", "timeout", deployment_id="dep-1")
+
+    monkeypatch.setitem(
+        registry._TOOLS, "dummy_create", registry.ToolSpec("dummy_create", "x", Args, handler, read_only=False)
+    )
+    first, err1 = await call_tool(ctx, "dummy_create", {"client_request_id": "r1"})
+    again, err2 = await call_tool(ctx, "dummy_create", {"client_request_id": "r1"})
+    assert err1 and err2 and calls == [1]
+    assert again["error"]["deployment_id"] == "dep-1" and again["meta"] == {"idempotent_replay": True}

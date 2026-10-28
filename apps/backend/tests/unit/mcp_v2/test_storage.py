@@ -1,3 +1,5 @@
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 from llm_d_lens.mcp_v2.context import ToolContext
@@ -70,6 +72,7 @@ class Storage:
             "nfs": body.get("nfs"),
             "knownNodes": [],
             "nodesAdded": [],
+            "createdAt": datetime.now(UTC).isoformat(),
         }
         return self.volume
 
@@ -337,12 +340,8 @@ async def test_timeout_during_create_keeps_the_row_and_get_reconciles_by_name(ap
 async def test_retry_after_unknown_outcome_points_at_the_existing_volume(api, ctx, lens, monkeypatch):
     monkeypatch.setenv(PREFIX_ENV, "/mnt/models")
     lens.volume = None
-    row = ctx.ledger.add_resource(
-        kind="storage_volume", owner="user-a", cluster_id="c1", name="fresh", state="creating"
-    )
-    lens.create(
-        None, {"name": "fresh", "kind": "local-disk", "capacity": "100Gi", "localDisk": {"hostPath": "/mnt/models/new"}}
-    )
+    row = pending_volume(ctx)
+    foreign_volume(lens)
     payload, is_error = await call_tool(ctx, "create_storage_volume", CREATE)
     assert is_error and payload["error"]["code"] == "already_exists" and payload["error"]["volume_id"] == row.id
     assert ctx.ledger.get(row.id).state == "active"
@@ -362,3 +361,83 @@ async def test_create_discards_the_row_only_on_a_clear_client_error(api, ctx, le
     assert {r.name: r.state for r in ctx.ledger.list_resources(owner="user-a", kind="storage_volume")} == {
         "fresh": "creating"
     }
+
+
+REQUEST = {"kind": "local-disk", "capacity": "100Gi", "path": "/mnt/models/new", "server": None}
+
+
+def pending_volume(ctx, **meta):
+    return ctx.ledger.add_resource(
+        kind="storage_volume",
+        owner="user-a",
+        cluster_id="c1",
+        name="fresh",
+        state="creating",
+        meta={"request": REQUEST, **meta},
+    )
+
+
+def age(ctx, row, seconds):
+    ctx.ledger._write("UPDATE resources SET created_at = created_at - ? WHERE id = ?", (seconds, row.id))
+
+
+def foreign_volume(lens, **override):
+    lens.create(
+        None, {"name": "fresh", "kind": "local-disk", "capacity": "100Gi", "localDisk": {"hostPath": "/mnt/models/new"}}
+    )
+    lens.volume.update(override)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"createdAt": (datetime.now(UTC) - timedelta(hours=2)).isoformat()},
+        {"createdAt": None},
+        {"localDisk": {"hostPath": "/mnt/models/elsewhere"}},
+        {"capacity": "500Gi"},
+    ],
+    ids=["created-before-the-row", "no-timestamp", "different-path", "different-capacity"],
+)
+async def test_same_name_volume_that_is_not_ours_is_never_claimed(api, ctx, lens, override):
+    row = pending_volume(ctx)
+    foreign_volume(lens, **override)
+    payload, is_error = await call_tool(ctx, "get_storage_volume", {"volume_id": row.id})
+    assert is_error and payload["error"]["code"] == "conflict_state"
+    assert ctx.ledger.get(row.id).lens_execution_id is None
+    done, _ = await call_tool(ctx, "delete_resources", {"ids": [row.id]})
+    assert done["results"][0]["status"] == "blocked" and lens.volume is not None
+
+
+@pytest.mark.asyncio
+async def test_volume_already_bound_to_another_row_is_not_claimed(api, ctx, lens):
+    foreign_volume(lens)
+    ctx.ledger.add_resource(
+        kind="storage_volume", owner="user-b", cluster_id="c1", name="fresh", lens_execution_id="storage-1"
+    )
+    row = pending_volume(ctx)
+    payload, is_error = await call_tool(ctx, "get_storage_volume", {"volume_id": row.id})
+    assert is_error and ctx.ledger.get(row.id).lens_execution_id is None
+
+
+@pytest.mark.asyncio
+async def test_expired_pending_volume_row_reports_how_to_clear_it_and_can_be_deleted(api, ctx, lens):
+    row = pending_volume(ctx)
+    foreign_volume(lens)
+    age(ctx, row, 700)
+    payload, is_error = await call_tool(ctx, "get_storage_volume", {"volume_id": row.id})
+    assert is_error and payload["error"]["code"] == "conflict_state"
+    assert "delete_resources" in payload["error"]["hint"] and row.id in payload["error"]["hint"]
+    done, _ = await call_tool(ctx, "delete_resources", {"ids": [row.id]})
+    assert done["deleted"] == [row.id] and lens.volume is not None  # the other user's volume is untouched
+    assert ctx.ledger.get(row.id).state == "deleted"
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_fresh_pending_row_is_blocked_as_in_use(api, ctx, lens):
+    lens.volume = None
+    row = pending_volume(ctx)
+    done, _ = await call_tool(ctx, "delete_resources", {"ids": [row.id]})
+    result = done["results"][0]
+    assert result["status"] == "blocked" and result["error"] == "in_use"
+    assert ctx.ledger.get(row.id).state == "creating"

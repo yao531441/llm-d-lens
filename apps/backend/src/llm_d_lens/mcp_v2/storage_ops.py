@@ -11,6 +11,7 @@ from .errors import ToolError
 from .kinds import register_kind
 from .ledger import Resource
 from .lens_api import LensApiError
+from .reconcile_rules import CLAIM_WINDOW_SECONDS, claim_expired, may_claim, row_age
 
 VOLUMES = "/storage/volumes"
 ENTRIES = "/model-cache/entries"
@@ -47,21 +48,46 @@ def outcome_unknown(row: Resource, error: BaseException) -> ToolError:
     )
 
 
+def matches_request(volume: dict[str, Any], request: Any) -> bool:
+    if not isinstance(request, dict):
+        return False
+    local = volume.get("localDisk") or {}
+    nfs = volume.get("nfs") or {}
+    return (
+        volume.get("kind") == request.get("kind")
+        and volume.get("capacity") == request.get("capacity")
+        and (local.get("hostPath") or nfs.get("path")) == request.get("path")
+        and (nfs.get("server") or None) == request.get("server")
+    )
+
+
 async def reconcile_volume(ctx: ToolContext, row: Resource) -> Resource:
     """Bind an unconfirmed ledger row to the Lens volume with its name on the same cluster, if Lens has one."""
-    if row.lens_execution_id or row.state not in ("creating", "deleting"):
+    if row.lens_execution_id or row.state not in ("creating", "deleting") or claim_expired(row):
         return row
     try:
         data = await ctx.api.request("GET", VOLUMES, params={"cluster_id": row.cluster_id})
     except Exception:  # noqa: BLE001 - still unknown; the caller reports it
         return row
     for volume in data.get("items") or []:
-        if str(volume.get("name", "")).lower() == (row.name or "").lower():
+        # volumes carry no owner, so the claim needs the name, the creation window and the exact spec we requested
+        same = str(volume.get("name", "")).lower() == (row.name or "").lower()
+        if same and matches_request(volume, row.meta.get("request")) and may_claim(ctx, row, volume):
             ctx.ledger.bind_execution(row.id, volume["id"])
             if row.state == "creating":
                 ctx.ledger.set_state(row.id, "active")
             return ctx.ledger.get(row.id) or row
     return row
+
+
+def pending_in_use(row: Resource) -> ToolError:
+    wait = max(1, round(CLAIM_WINDOW_SECONDS - row_age(row)))
+    return ToolError(
+        "in_use",
+        f"The creation of volume '{row.name}' is still unconfirmed and may yet complete in Lens.",
+        hint=f"Call get_storage_volume(volume_id='{row.id}') to reconcile it; if nothing appears, "
+        f"delete_resources will clear the record in about {wait} seconds.",
+    )
 
 
 def volume_not_found(volume_id: str) -> ToolError:
@@ -86,7 +112,12 @@ async def resolve_volume(ctx: ToolContext, volume_id: str) -> VolumeRef:
                 "conflict_state",
                 f"{volume_id} was being created but Lens has not confirmed it, so it may not exist.",
                 field="volume_id",
-                hint="Retry shortly. If it stays unconfirmed, remove the record with delete_resources.",
+                hint=(
+                    "Retry shortly."
+                    if not claim_expired(row)
+                    else f"No matching volume appeared within {CLAIM_WINDOW_SECONDS // 60} minutes; "
+                    "remove the record with delete_resources(ids=['" + volume_id + "'])."
+                ),
             )
         if row.owner != ctx.owner:
             return VolumeRef(None, row.lens_execution_id, foreign_owner=True)
@@ -239,7 +270,9 @@ async def describe(ctx: ToolContext, row: Resource) -> dict[str, Any]:
 
 async def dependents(ctx: ToolContext, row: Resource) -> list[dict[str, Any]]:
     row = await reconcile_volume(ctx, row)
-    volume_id = row.lens_execution_id or ""
+    volume_id = row.lens_execution_id
+    if not volume_id:
+        return []
     try:
         volume = await load_volume(ctx, volume_id)
         entries = await load_entries(ctx, volume_id)
@@ -271,6 +304,8 @@ async def delete(ctx: ToolContext, row: Resource, cascade: bool) -> None:
     row = await reconcile_volume(ctx, row)
     volume_id = row.lens_execution_id
     if not volume_id:
+        if not claim_expired(row):
+            raise pending_in_use(row)
         return
     try:
         # Keep the files: deleting the Lens record must not erase models that may be shared or hand-copied.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from typing import Any
 
 from .context import ToolContext
@@ -12,6 +13,7 @@ from .ledger import Resource
 from .lens_api import LensApiError
 
 POLL_SECONDS = 2.0
+CREATE_GRACE_SECONDS = 300
 SETTLED = {"completed", "failed", "cancelled"}
 ACTIVE = {"queued", "running"}
 _STATUS = {"completed": "succeeded"}
@@ -188,9 +190,33 @@ def estimate_replay(timeline: dict[str, Any], duration_seconds: int, scale_facto
     }
 
 
+async def adopt_unbound(ctx: ToolContext, row: Resource) -> Resource:
+    """Link a ``creating`` record to its Lens task when the create response was lost (single exact name match only)."""
+    if row.kind != "simulation" or row.lens_execution_id or row.state != "creating":
+        return row
+    page = await ctx.api.request("GET", "/simulation/tasks", params={"limit": 100})
+    candidates = [
+        task
+        for task in page.get("tasks") or []
+        if task.get("name") == row.name and ctx.ledger.find_by_execution(task["id"]) is None
+    ]
+    if len(candidates) != 1:
+        return row
+    ctx.ledger.bind_execution(row.id, candidates[0]["id"])
+    ctx.ledger.set_state(row.id, "active")
+    return ctx.ledger.get(row.id) or row
+
+
 async def delete_simulation(ctx: ToolContext, row: Resource, cascade: bool) -> None:
+    row = await adopt_unbound(ctx, row)
     task_id = row.lens_execution_id
     if not task_id:
+        if time.time() - row.created_at < CREATE_GRACE_SECONDS:
+            raise ToolError(
+                "in_use",
+                f"Lens has not confirmed whether {row.id} was created.",
+                hint="Wait a few minutes and delete again; the record is then removed if no replay started.",
+            )
         return
     try:
         task = await fetch_task(ctx, task_id)
@@ -218,6 +244,7 @@ async def delete_simulation(ctx: ToolContext, row: Resource, cascade: bool) -> N
 
 
 async def describe_simulation(ctx: ToolContext, row: Resource) -> dict[str, Any]:
+    row = await adopt_unbound(ctx, row)
     if not row.lens_execution_id:
         return {}
     task = await fetch_task(ctx, row.lens_execution_id)
