@@ -68,7 +68,7 @@ def test_hidden_migrated_routes_participate_in_startup_validation(monkeypatch):
         "/api/guide-planning",
     )
     expected = {(entry.method, entry.path) for entry in routes.ROUTE_PERMISSIONS if entry.path.startswith(prefixes)}
-    assert len(expected) == 26
+    assert len(expected) == 29
     assert expected <= routes.app_route_table(app)
     assert routes.validate_route_registry(app) == []
     monkeypatch.setattr(

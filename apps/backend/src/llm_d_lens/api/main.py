@@ -53,6 +53,7 @@ from llm_d_lens.hardware.router import router as hardware_router
 from llm_d_lens.infrastructure.kubernetes import router as cluster_router
 from llm_d_lens.infrastructure.network import hostinfo as _hostinfo
 from llm_d_lens.mcp.router import router as mcp_router
+from llm_d_lens.mcp_v2.router import router as mcp_v2_router
 from llm_d_lens.model_cache.router import router as model_cache_router
 from llm_d_lens.model_service.router import admin_router as model_service_admin_router
 from llm_d_lens.model_service.router import internal_router as model_service_internal_router
@@ -336,6 +337,7 @@ app.include_router(deploy_router)
 app.include_router(legacy_poc_router)
 app.include_router(guide_planning_router)
 app.include_router(mcp_router)
+app.include_router(mcp_v2_router)
 app.include_router(playground_router)
 app.include_router(web_router)
 app.include_router(remote_deploy_router)
