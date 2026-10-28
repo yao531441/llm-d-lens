@@ -10,16 +10,24 @@ disturb each other's measurements.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import hashlib
 import json
 import random
 import time
+import uuid
 from typing import Any
 
 from .context import ToolContext
 from .errors import ToolError
-from .experiments_deploy import delete_deployment, deployment_state, launch_spec
+from .experiments_deploy import (
+    LaunchUncertainError,
+    adopt_created_run,
+    delete_deployment,
+    deployment_state,
+    launch_spec,
+)
 from .experiments_results import (
     DEFAULT_COMPARE_METRICS,
     aggregate,
@@ -34,6 +42,11 @@ from .lens_api import LensApiError
 DEPLOY_TIMEOUT_SECONDS = 1800
 LAUNCH_BATCH = 3
 CANCEL_WAIT_SECONDS = 20
+CANCEL_TIMEOUT_SECONDS = 600
+CREATE_RECONCILE_SECONDS = 600
+MAX_CREATE_ATTEMPTS = 2
+LEASE_TTL_SECONDS = 300
+LEASE_WAIT_SECONDS = 10
 MAX_EVENTS = 40
 NOISY_SPREAD_PCT = 10.0
 _TEXT_TAIL = 1500
@@ -43,6 +56,39 @@ _DONE = ("succeeded", "failed", "cancelled", "skipped")
 
 def _lock(exp_id: str) -> asyncio.Lock:
     return _LOCKS.setdefault(exp_id, asyncio.Lock())
+
+
+class _LeaseLostError(Exception):
+    """Another session took over the experiment after our lease expired; stop without writing."""
+
+
+class _Lease:
+    def __init__(self, ctx: ToolContext, exp_id: str):
+        self.ctx, self.key, self.holder = ctx, f"exp:{exp_id}", uuid.uuid4().hex
+
+    def renew(self) -> bool:
+        return self.ctx.ledger.acquire_lease(self.key, self.holder, LEASE_TTL_SECONDS)
+
+    def check(self) -> None:
+        if not self.renew():
+            raise _LeaseLostError
+
+
+@contextlib.asynccontextmanager
+async def _exclusive(ctx: ToolContext, exp_id: str, wait_seconds: float = 0.0):
+    """In-process lock plus the ledger lease; yields the lease, or ``None`` if another session holds it."""
+    async with _lock(exp_id):
+        lease = _Lease(ctx, exp_id)
+        deadline = time.monotonic() + wait_seconds
+        while not lease.renew():
+            if time.monotonic() >= deadline:
+                yield None
+                return
+            await asyncio.sleep(1)
+        try:
+            yield lease
+        finally:
+            ctx.ledger.release_lease(lease.key, lease.holder)
 
 
 def build_units(design: dict[str, Any]) -> list[dict[str, Any]]:
@@ -200,6 +246,7 @@ async def _start_unit(ctx: ToolContext, s: dict[str, Any]) -> None:
 async def _launch_one(ctx: ToolContext, s: dict[str, Any], vid: str) -> None:
     design, variant = s["design"], s["variants"][vid]
     spec = next(v["spec"] for v in design["variants"] if v["variant_id"] == vid)
+    variant["create_attempts"] = variant.get("create_attempts", 0) + 1
     try:
         row = await launch_spec(
             ctx,
@@ -209,6 +256,10 @@ async def _launch_one(ctx: ToolContext, s: dict[str, Any], vid: str) -> None:
             variant_id=vid,
             expires_at=s["expires_at"],
         )
+    except LaunchUncertainError as error:
+        variant.update(deploy="creating", dep_id=error.row_id, deploy_started_at=time.time())
+        _event(s, f"{vid}: deployment creation unconfirmed, reconciling")
+        return
     except ToolError as error:
         variant.update(deploy="failed", failure=error.message[:500])
         _event(s, f"{vid}: deployment could not be created")
@@ -219,6 +270,39 @@ async def _launch_one(ctx: ToolContext, s: dict[str, Any], vid: str) -> None:
         return
     variant.update(deploy="deploying", dep_id=row.id, deploy_started_at=time.time())
     _event(s, f"{vid}: deployment {row.id} started")
+
+
+async def _reconcile(ctx: ToolContext, s: dict[str, Any]) -> None:
+    """Resolve deployments whose creation was unconfirmed (timeout, 5xx, cancelled call) before creating again."""
+    children = ctx.ledger.children(s["exp_id"])
+    for vid, v in s["variants"].items():
+        orphan = next((c for c in children if c.meta.get("variant_id") == vid), None)
+        if v["deploy"] == "none" and orphan is not None:
+            started = orphan.meta.get("launch_epoch", time.time())
+            v.update(
+                deploy="deploying" if orphan.lens_run_id else "creating", dep_id=orphan.id, deploy_started_at=started
+            )
+    for vid, v in s["variants"].items():
+        if v["deploy"] != "creating":
+            continue
+        row = ctx.ledger.get(v["dep_id"])
+        if row is None or row.state == "deleted":
+            v.update(deploy="none", dep_id=None)
+            continue
+        try:
+            found = bool(row.lens_run_id) or await adopt_created_run(ctx, row)
+        except LensApiError:
+            continue
+        if found:
+            v.update(deploy="deploying", deploy_started_at=time.time())
+            _event(s, f"{vid}: deployment {row.id} confirmed")
+        elif time.time() - row.meta.get("launch_epoch", v.get("deploy_started_at", 0)) > CREATE_RECONCILE_SECONDS:
+            ctx.ledger.set_state(row.id, "deleted")
+            if v.get("create_attempts", 1) >= MAX_CREATE_ATTEMPTS:
+                v.update(deploy="failed", dep_id=None, failure="Lens never confirmed the deployment creation.")
+            else:
+                v.update(deploy="none", dep_id=None)
+            _event(s, f"{vid}: unconfirmed deployment {row.id} abandoned")
 
 
 def _live_spec(s: dict[str, Any]) -> bool:
@@ -243,18 +327,22 @@ async def _launch(ctx: ToolContext, s: dict[str, Any]) -> None:
 async def _cleanup(ctx: ToolContext, s: dict[str, Any]) -> None:
     if (s["cancel"] or {}).get("defer_cleanup"):
         return
-    keep = s["design"]["keep_deployments"] or (s["cancel"] or {}).get("keep_deployments")
     todo = []
     for vid, v in s["variants"].items():
         busy = any(u["variant"] == vid and u["status"] in ("pending", "running") for u in s["units"])
         if v["cleanup"] == "pending" and not v["dep_id"] and v["deploy"] in ("none", "failed") and not busy:
             v["cleanup"] = "n/a"
-        if v["cleanup"] in ("pending", "failed") and v["dep_id"] and v["deploy"] != "none" and not busy:
+        if (
+            v["cleanup"] in ("pending", "failed")
+            and v["dep_id"]
+            and v["deploy"] not in ("none", "creating")
+            and not busy
+        ):
             todo.append((vid, v))
 
     async def one(vid: str, v: dict[str, Any]) -> None:
         row = ctx.ledger.get(v["dep_id"])
-        if keep:
+        if s["design"]["keep_deployments"] or v.get("keep"):
             v["cleanup"] = "kept"
             ctx.ledger.bind_root(v["dep_id"], v["dep_id"])
             return
@@ -283,7 +371,21 @@ async def _apply_cancel(ctx: ToolContext, s: dict[str, Any]) -> None:
             unit["status"] = "cancelled"
     unit = _running(s)
     target_running = unit is not None and unit["variant"] in targets
-    if target_running:
+    if target_running and time.time() - cancel["at"] > CANCEL_TIMEOUT_SECONDS:
+        unit.update(
+            status="cancelled",
+            local_cancel=True,
+            finished_epoch=time.time(),
+            error={"message": "Lens did not confirm the cancellation; marked cancelled locally."},
+        )
+        warning = (
+            f"Benchmark run {unit['run_id']} did not reach a terminal state "
+            f"{CANCEL_TIMEOUT_SECONDS // 60} minutes after cancelling; it is marked cancelled locally and may still "
+            "hold its deployment (cleanup then reports a residual)."
+        )
+        s["warnings"] = [*s.get("warnings", []), warning]
+        _event(s, f"{unit['id']}: cancellation unconfirmed, marked cancelled locally")
+    elif target_running:
         if not unit.get("cancel_sent"):
             try:
                 await ctx.api.request("POST", f"/evaluate/runs/{unit['run_id']}/cancel", timeout=60)
@@ -304,52 +406,70 @@ def _settle(s: dict[str, Any]) -> None:
 
 
 def has_residuals(s: dict[str, Any]) -> bool:
-    return any(v["cleanup"] == "failed" for v in s["variants"].values())
+    """Cleanup that failed, or (once settled) a deployment whose teardown has not happened yet."""
+    return any(
+        v["cleanup"] == "failed" or (s["phase"] == "settled" and v["cleanup"] == "pending" and v["dep_id"])
+        for v in s["variants"].values()
+    )
 
 
-async def _step(ctx: ToolContext, s: dict[str, Any], allow_launch: bool) -> None:
+async def _step(ctx: ToolContext, s: dict[str, Any], allow_launch: bool, lease: _Lease) -> None:
+    lease.check()
+    await _reconcile(ctx, s)
     if s["phase"] == "settled":
         await _cleanup(ctx, s)
         return
+    lease.check()
     if s["cancel"]:
         await _apply_cancel(ctx, s)
     else:
         await _poll_deployments(ctx, s)
         await _poll_unit(ctx, s)
         _skip_dead(s)
+        lease.check()
         await _start_unit(ctx, s)
+        lease.check()
         if allow_launch:
             await _launch(ctx, s)
     _skip_dead(s)
+    lease.check()
     await _cleanup(ctx, s)
     _settle(s)
 
 
-async def _advance_locked(ctx: ToolContext, exp_id: str, allow_launch: bool) -> Resource | None:
+async def _advance_locked(ctx: ToolContext, exp_id: str, allow_launch: bool, lease: _Lease) -> Resource | None:
+    """Read-modify-write of the experiment state; the caller holds the lease for the whole call."""
     row = ctx.ledger.get(exp_id)
     if row is None or row.state == "deleted" or "phase" not in row.meta:
         return row
     if row.meta["phase"] == "settled" and not has_residuals(row.meta):
         return row
     s = copy.deepcopy(row.meta)
+    lost = False
     try:
-        await _step(ctx, s, allow_launch)
+        await _step(ctx, s, allow_launch, lease)
         s["last_error"] = None
     except (LensApiError, ToolError) as error:
         s["last_error"] = (
             (getattr(error, "message", None) or str(error)) if isinstance(error, ToolError) else error.message()
         )
+    except _LeaseLostError:
+        lost = True
     finally:
-        ctx.ledger.update_meta(exp_id, s)
-        if s["phase"] == "settled":
-            ctx.ledger.set_state(exp_id, "completed")
+        if not lost and lease.renew():
+            ctx.ledger.update_meta(exp_id, s)
+            if s["phase"] == "settled":
+                ctx.ledger.set_state(exp_id, "completed")
     return ctx.ledger.get(exp_id)
 
 
-async def advance(ctx: ToolContext, exp_id: str, *, allow_launch: bool = True) -> Resource | None:
-    """Move the experiment forward by one bounded step; safe to call concurrently and repeatedly."""
-    async with _lock(exp_id):
-        return await _advance_locked(ctx, exp_id, allow_launch)
+async def advance(ctx: ToolContext, exp_id: str, *, allow_launch: bool = True) -> tuple[Resource | None, bool]:
+    """One bounded step. Returns ``(row, contended)``; contended means another session holds the experiment's
+    lease, so nothing was advanced and ``row`` is the last persisted state."""
+    async with _exclusive(ctx, exp_id) as lease:
+        if lease is None:
+            return ctx.ledger.get(exp_id), True
+        return await _advance_locked(ctx, exp_id, allow_launch, lease), False
 
 
 def fingerprint(s: dict[str, Any]) -> str:
@@ -358,9 +478,11 @@ def fingerprint(s: dict[str, Any]) -> str:
     )
 
 
-async def wait_for_change(ctx: ToolContext, exp_id: str, wait_seconds: float, until: str) -> Resource | None:
+async def wait_for_change(
+    ctx: ToolContext, exp_id: str, wait_seconds: float, until: str
+) -> tuple[Resource | None, bool]:
     deadline = time.monotonic() + wait_seconds
-    row = await advance(ctx, exp_id)
+    row, contended = await advance(ctx, exp_id)
     first = fingerprint(row.meta) if row else ""
     while row and wait_seconds > 0:
         if row.meta.get("phase") == "settled" and not has_residuals(row.meta):
@@ -369,10 +491,10 @@ async def wait_for_change(ctx: ToolContext, exp_id: str, wait_seconds: float, un
         if remaining <= 0:
             break
         await asyncio.sleep(min(3.0, remaining))
-        row = await advance(ctx, exp_id, allow_launch=deadline - time.monotonic() > 20)
+        row, contended = await advance(ctx, exp_id, allow_launch=deadline - time.monotonic() > 20)
         if row and until == "change" and fingerprint(row.meta) != first:
             break
-    return row
+    return row, contended
 
 
 async def request_cancel(
@@ -386,24 +508,35 @@ async def request_cancel(
     defer_cleanup: bool = False,
 ) -> Resource | None:
     """Cancel -> wait for the Lens run to be terminal -> delete temporary deployments, in that order."""
-    async with _lock(exp_id):
+    async with _exclusive(ctx, exp_id, LEASE_WAIT_SECONDS) as lease:
+        if lease is None:
+            raise ToolError(
+                "conflict_state",
+                f"Another session is currently advancing {exp_id}.",
+                hint="Retry cancel_experiment in a few seconds.",
+            )
         row = ctx.ledger.get(exp_id)
         if row is None or row.meta.get("phase") == "settled":
-            return await _advance_locked(ctx, exp_id, False)
+            return await _advance_locked(ctx, exp_id, False, lease)
+        previous = row.meta.get("cancel") or {}
         cancel = {
             "variant_ids": variant_ids,
             "keep_deployments": keep_deployments,
             "defer_cleanup": defer_cleanup,
             "reason": reason,
-            "at": time.time(),
+            "at": previous.get("at") or time.time(),
         }
-        patch: dict[str, Any] = {"cancel": cancel}
+        variants = copy.deepcopy(row.meta["variants"])
+        if keep_deployments:
+            for vid in variant_ids or variants:
+                variants[vid]["keep"] = True
+        patch: dict[str, Any] = {"cancel": cancel, "variants": variants}
         if not variant_ids:
             patch["phase"] = "cancelling"
         ctx.ledger.update_meta(exp_id, patch)
         deadline = time.monotonic() + (CANCEL_WAIT_SECONDS if wait_seconds is None else wait_seconds)
         while True:
-            row = await _advance_locked(ctx, exp_id, False)
+            row = await _advance_locked(ctx, exp_id, False, lease)
             settled = row.meta["phase"] == "settled" and not has_residuals(row.meta)
             if settled or row.meta["cancel"] is None or time.monotonic() >= deadline:
                 return row
@@ -554,7 +687,7 @@ def _eta(s: dict[str, Any]) -> int | None:
     return seconds + pending_deploys * 600
 
 
-def build_view(row: Resource, include: list[str], is_mine: bool = True) -> dict[str, Any]:
+def build_view(row: Resource, include: list[str], is_mine: bool = True, contended: bool = False) -> dict[str, Any]:
     s = row.meta
     counts = unit_counts(s)
     total = len(s["units"])
@@ -583,10 +716,15 @@ def build_view(row: Resource, include: list[str], is_mine: bool = True) -> dict[
     }
     if s.get("last_error"):
         view["advance_error"] = s["last_error"]
+    if s.get("warnings"):
+        view["warnings"] = s["warnings"]
     if s["phase"] != "settled":
         view["next"] = "Poll get_experiment (wait_seconds up to 25); progress advances while you poll."
     elif execution_state(s) in ("succeeded", "partially_succeeded"):
         view["next"] = "Read results with get_experiment(include=['results','comparison']) or compare_results."
+    if contended:
+        view["advancing_elsewhere"] = True
+        view["note"] = "Another session is advancing this experiment; this is the last persisted state. Retry shortly."
     if "results" in include or "points" in include:
         view["results"] = [_result_view(entry, "points" in include) for entry in entries]
     if "comparison" in include:
@@ -668,17 +806,31 @@ async def delete_experiment(ctx: ToolContext, row: Resource, cascade: bool) -> N
     for unit in row.meta.get("units", []):
         if not unit.get("run_id"):
             continue
+        local_cancel = bool(unit.get("local_cancel"))
         try:
             await ctx.api.request("DELETE", f"/evaluate/runs/{unit['run_id']}", timeout=60)
         except LensApiError as error:
-            if error.status == 409:
+            if error.status == 409 and not local_cancel:
                 raise ToolError(
                     "in_use", f"Benchmark run {unit['run_id']} is not finished yet.", hint="Retry shortly."
                 ) from error
-            if error.status != 404:
+            if error.status not in (404, 409):
                 raise
     for child in ctx.ledger.children(row.id):
-        if child.kind == "deployment" and not await delete_deployment(ctx, child):
+        if child.kind != "deployment":
+            continue
+        if child.state == "creating" and not child.lens_run_id:
+            with contextlib.suppress(LensApiError):
+                await adopt_created_run(ctx, child)
+            child = ctx.ledger.get(child.id) or child
+            age = time.time() - child.meta.get("launch_epoch", 0)
+            if not child.lens_run_id and age < CREATE_RECONCILE_SECONDS:
+                raise ToolError(
+                    "in_use",
+                    f"Creation of temporary deployment {child.id} is unconfirmed.",
+                    hint="Retry delete_resources in a few minutes.",
+                )
+        if not await delete_deployment(ctx, child):
             raise ToolError(
                 "in_use",
                 f"Temporary deployment {child.id} is still in use by Lens.",

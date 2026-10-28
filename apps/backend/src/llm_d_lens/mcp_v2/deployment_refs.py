@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,6 +10,9 @@ from .context import ToolContext
 from .errors import ToolError
 from .ledger import Resource
 from .lens_api import LensApiError
+
+# How long a 'creating' row waits for Lens to show its run before the create is considered lost.
+CREATE_GRACE_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -78,6 +82,22 @@ async def run_execution_id(ctx: ToolContext, run_id: str) -> str | None:
     return (case or {}).get("execution_id")
 
 
+async def reconcile_creating(ctx: ToolContext, row: Resource) -> Resource:
+    """Rows left in 'creating' by an unconfirmed create: bind the Lens run that carries their ledger_id."""
+    try:
+        runs = await ctx.api.request("GET", "/deployments/runs")
+    except Exception:  # noqa: BLE001  (best effort; the row stays 'creating' and is retried on the next read)
+        return row
+    items = runs if isinstance(runs, list) else (runs or {}).get("items") or []
+    match = next((run for run in items if (run.get("provenance") or {}).get("ledger_id") == row.id), None)
+    if match:
+        ctx.ledger.bind_run(row.id, match["id"])
+        ctx.ledger.set_state(row.id, "active")
+    elif time.time() - row.created_at > CREATE_GRACE_SECONDS:
+        ctx.ledger.set_state(row.id, "deleted")
+    return ctx.ledger.get(row.id) or row
+
+
 async def resolve(ctx: ToolContext, deployment_id: str) -> DeploymentRef:
     """Accepts a ledger id (``dep-...``) or a raw Lens execution id; ownership comes only from the ledger."""
     foreign = False
@@ -91,6 +111,8 @@ async def resolve(ctx: ToolContext, deployment_id: str) -> DeploymentRef:
             row, foreign = None, True
     if row is None:
         return DeploymentRef(None, deployment_id, None, foreign_owner=foreign)
+    if row.state == "creating" and not row.lens_run_id:
+        row = await reconcile_creating(ctx, row)
     execution_id = row.lens_execution_id
     previous = row.meta.get("restarting_from")
     if (execution_id is None or previous) and row.lens_run_id:

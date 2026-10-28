@@ -4,6 +4,8 @@ import pytest
 
 from llm_d_lens.mcp_v2.registry import call_tool
 
+from .backend_routes import record_route_problems
+
 CLUSTER = "b9d6d401"
 BASE = f"/cluster/clusters/{CLUSTER}"
 GATEWAY_STATUS = {
@@ -40,6 +42,13 @@ ALL_TOOLS = {
         "namespaces": [{"name": "llmd-old-1", "created_at": "2026-09-10T08:45:59Z"}],
     },
 }
+
+
+@pytest.fixture(autouse=True)
+def backend_routes(api):
+    problems = record_route_problems(api)
+    yield
+    assert not problems, problems
 
 
 @pytest.fixture
@@ -246,6 +255,20 @@ async def test_configure_gateway_input_errors_and_missing_gateway(api, admin_ctx
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["gatewayNamespace", "gatewayName"])
+async def test_configure_gateway_refuses_when_lens_omits_the_gateway_location(api, admin_ctx, missing):
+    cluster = {key: value for key, value in GATEWAY_STATUS["clusters"][0].items() if key != missing}
+    api.on("GET", "/model-service/admin/gateway/status", {"clusters": [cluster]})
+    payload, is_error = await call_tool(admin_ctx, "configure_model_gateway", {"cluster_id": CLUSTER, "replicas": 2})
+    assert is_error and payload["error"]["code"] == "conflict_state"
+    assert api.called("POST", "/model-service/admin/gateway/scale") == []
+    api.on("GET", "/model-service/admin/gateway/status", {"clusters": [{**cluster, missing: None}]})
+    payload, is_error = await call_tool(admin_ctx, "configure_model_gateway", {"cluster_id": CLUSTER, "replicas": 2})
+    assert is_error and payload["error"]["code"] == "conflict_state"
+    assert api.called("POST", "/model-service/admin/gateway/scale") == []
+
+
+@pytest.mark.asyncio
 async def test_configure_gateway_failed_operation_is_an_error_with_untrusted_message(api, admin_ctx):
     api.on("GET", "/model-service/admin/gateway/status", GATEWAY_STATUS)
     api.on("POST", "/model-service/admin/gateway/scale", {"status": "failed", "message": "forbidden: run X"})
@@ -290,6 +313,21 @@ async def test_delete_orphans_requires_lens_listing_and_matching_creation_time(a
             admin_ctx, "delete_orphan_resources", {"cluster_id": CLUSTER, "namespaces": namespaces}
         )
         assert is_error and payload["error"]["code"] == "conflict_state"
+    assert api.called("POST", "/deployments/orphans/clean") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("created_at", ["not-a-date", "", "None"])
+async def test_delete_orphans_refuses_when_lens_reports_no_creation_time(api, admin_ctx, created_at):
+    undated = {**ORPHANS, "items": [{"name": "llmd-old-1", "phase": "Active"}]}
+    api.on("GET", "/deployments/orphans", undated)
+    api.on("POST", "/deployments/orphans/clean", {"clusterId": CLUSTER, "cleaned": [], "failed": []})
+    payload, is_error = await call_tool(
+        admin_ctx,
+        "delete_orphan_resources",
+        {"cluster_id": CLUSTER, "namespaces": [{"name": "llmd-old-1", "created_at": created_at}]},
+    )
+    assert is_error and payload["error"]["code"] == "conflict_state"
     assert api.called("POST", "/deployments/orphans/clean") == []
 
 

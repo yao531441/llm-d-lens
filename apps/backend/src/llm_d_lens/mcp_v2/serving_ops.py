@@ -26,6 +26,44 @@ class ServiceRef:
         return self.row is not None and self.row.state in ("active", "deleting")
 
 
+def is_definite_failure(error: BaseException) -> bool:
+    """True when Lens clearly refused the request, so nothing was created."""
+    if isinstance(error, ToolError):
+        return True
+    return isinstance(error, LensApiError) and 400 <= error.status < 500 and error.status not in (408, 429)
+
+
+def outcome_unknown(row: Resource, error: BaseException) -> ToolError:
+    cause = f"HTTP {error.status}" if isinstance(error, LensApiError) else type(error).__name__
+    return ToolError(
+        "upstream_unavailable",
+        f"Lens did not confirm whether service '{row.name}' was published ({cause}); it may exist.",
+        hint=f"Wait a moment, then call get_model_service(service_id='{row.id}'); it reconciles by name. "
+        "Do not publish the same name again before that.",
+        service_id=row.id,
+    )
+
+
+async def reconcile_service(ctx: ToolContext, row: Resource) -> Resource:
+    """Bind an unconfirmed ledger row to the Lens group with its name, if Lens has one."""
+    if row.lens_execution_id or row.state not in ("creating", "deleting"):
+        return row
+    try:
+        groups = (await ctx.api.request("GET", f"{ADMIN}/groups")).get("items") or []
+    except Exception:  # noqa: BLE001 - still unknown; the caller reports it
+        return row
+    for group in groups:
+        same = (
+            group.get("clusterId") == row.cluster_id and str(group.get("name", "")).lower() == (row.name or "").lower()
+        )
+        if same and group.get("ownerUserId") in (None, ctx.owner):
+            ctx.ledger.bind_execution(row.id, group["id"])
+            if row.state == "creating":
+                ctx.ledger.set_state(row.id, "active")
+            return ctx.ledger.get(row.id) or row
+    return row
+
+
 def service_not_found(service_id: str) -> ToolError:
     return ToolError(
         "not_found",
@@ -39,8 +77,17 @@ async def resolve_service(ctx: ToolContext, service_id: str) -> ServiceRef:
     """Accepts a ledger id (``svc-...``) or a raw Lens group id; ownership comes only from the ledger."""
     if service_id.startswith("svc-"):
         row = ctx.ledger.get(service_id)
-        if row is None or row.kind != "model_service" or row.state == "deleted" or not row.lens_execution_id:
+        if row is None or row.kind != "model_service" or row.state == "deleted":
             raise service_not_found(service_id)
+        if not row.lens_execution_id and row.owner == ctx.owner:
+            row = await reconcile_service(ctx, row)
+        if not row.lens_execution_id:
+            raise ToolError(
+                "conflict_state",
+                f"{service_id} was being published but Lens has not confirmed it, so it may not exist.",
+                field="service_id",
+                hint="Retry shortly. If it stays unconfirmed, remove the record with delete_resources.",
+            )
         if row.owner != ctx.owner:
             return ServiceRef(None, row.lens_execution_id, foreign_owner=True)
         return ServiceRef(row, row.lens_execution_id)
@@ -158,6 +205,9 @@ def conflict_error(error: LensApiError) -> LensApiError | ToolError:
 
 
 async def describe(ctx: ToolContext, row: Resource) -> dict[str, Any]:
+    row = await reconcile_service(ctx, row)
+    if not row.lens_execution_id:
+        return {"live_status": "unconfirmed"}
     try:
         group, members = await load_service(ctx, row.lens_execution_id or "")
     except ToolError:
@@ -171,6 +221,9 @@ async def describe(ctx: ToolContext, row: Resource) -> dict[str, Any]:
 
 
 async def dependents(ctx: ToolContext, row: Resource) -> list[dict[str, Any]]:
+    row = await reconcile_service(ctx, row)
+    if not row.lens_execution_id:
+        return []
     try:
         group, members = await load_service(ctx, row.lens_execution_id or "")
     except ToolError:
@@ -202,6 +255,7 @@ async def dependents(ctx: ToolContext, row: Resource) -> list[dict[str, Any]]:
 
 
 async def delete(ctx: ToolContext, row: Resource, cascade: bool) -> None:
+    row = await reconcile_service(ctx, row)
     group_id = row.lens_execution_id
     if not group_id:
         return

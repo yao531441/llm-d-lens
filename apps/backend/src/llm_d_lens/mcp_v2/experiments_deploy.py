@@ -9,6 +9,7 @@ parented to the experiment. When the deployments module exposes a different crea
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from .context import ToolContext
@@ -19,6 +20,7 @@ from .lens_api import LensApiError
 from .planning import build_plan
 
 CREATED_VIA = "lens-mcp-v2"
+DELETE_TIMEOUT_SECONDS = 150  # stays well below the experiment lease TTL
 _GONE = {"cleaned", "cleaned_up", "rolled_back", "rolling_back"}
 
 
@@ -79,7 +81,13 @@ async def launch_spec(
         name=payload["name"],
         root_id=root_id,
         state="creating",
-        meta={"spec": payload["spec"], "experiment_id": root_id, "variant_id": variant_id, "expires_at": expires_at},
+        meta={
+            "spec": payload["spec"],
+            "experiment_id": root_id,
+            "variant_id": variant_id,
+            "expires_at": expires_at,
+            "launch_epoch": time.time(),
+        },
     )
     try:
         run = await ctx.api.request(
@@ -97,13 +105,45 @@ async def launch_spec(
             },
             timeout=120,
         )
-    except BaseException:
-        ctx.ledger.set_state(row.id, "deleted")
-        raise
+    except LensApiError as error:
+        if 400 <= error.status < 500 and error.status != 408:
+            ctx.ledger.set_state(row.id, "deleted")
+            raise
+        raise LaunchUncertainError(row.id) from error
+    except Exception as error:
+        # Timeout or transport failure: Lens may have accepted the request, so the row stays "creating" for
+        # reconciliation by ledger_id. CancelledError is a BaseException and propagates the same way.
+        raise LaunchUncertainError(row.id) from error
     ctx.ledger.bind_run(row.id, run["id"])
     ctx.ledger.set_state(row.id, "active")
     ctx.ledger.drop_plan(plan["plan_id"])
     return ctx.ledger.get(row.id)  # type: ignore[return-value]
+
+
+class LaunchUncertainError(Exception):
+    """The create request may or may not have reached Lens; the ledger row (``row_id``) stays ``creating``."""
+
+    def __init__(self, row_id: str):
+        super().__init__(f"Creation of {row_id} is unconfirmed.")
+        self.row_id = row_id
+
+
+async def adopt_created_run(ctx: ToolContext, row: Resource) -> bool:
+    """Bind the Lens run that carries this row's ``ledger_id`` provenance; ``False`` when none is visible (yet)."""
+    runs = await ctx.api.request("GET", "/deployments/runs")
+    run = next(
+        (
+            item
+            for item in runs or []
+            if isinstance(item, dict) and (item.get("provenance") or {}).get("ledger_id") == row.id
+        ),
+        None,
+    )
+    if run is None:
+        return False
+    ctx.ledger.bind_run(row.id, run["id"])
+    ctx.ledger.set_state(row.id, "active")
+    return True
 
 
 async def _execution_id(ctx: ToolContext, row: Resource) -> str | None:
@@ -160,10 +200,13 @@ async def delete_deployment(ctx: ToolContext, row: Resource) -> bool:
     try:
         if execution_id:
             await ctx.api.request(
-                "DELETE", f"/deployments/executions/{execution_id}", params={"delete_namespace": True}, timeout=300
+                "DELETE",
+                f"/deployments/executions/{execution_id}",
+                params={"delete_namespace": True},
+                timeout=DELETE_TIMEOUT_SECONDS,
             )
         elif row.lens_run_id:
-            await ctx.api.request("DELETE", f"/deployments/runs/{row.lens_run_id}", timeout=300)
+            await ctx.api.request("DELETE", f"/deployments/runs/{row.lens_run_id}", timeout=DELETE_TIMEOUT_SECONDS)
     except LensApiError as error:
         if error.status == 409 and error.code() == "deployment_in_use":
             return False

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
 from .context import ToolContext
 from .errors import ToolError
 from .ledger import Resource
+from .lens_api import LensApiError
 
 CREATED_VIA = "lens-mcp-v2"
 DEFAULT_TTL_HOURS = 8
@@ -15,6 +17,17 @@ DEFAULT_TTL_HOURS = 8
 
 def expires_at(ttl_hours: int) -> float:
     return time.time() + ttl_hours * 3600
+
+
+def _uncertain(row: Resource) -> ToolError:
+    return ToolError(
+        "upstream_unavailable",
+        "Lens did not confirm the deployment request, so it may or may not have been created.",
+        field="plan_id",
+        hint=f"Call get_deployment(deployment_id='{row.id}') in a minute: it is matched to the Lens run once it "
+        "exists; if it never appears the record is dropped. Do not create it again before checking.",
+        deployment_id=row.id,
+    )
 
 
 async def launch_plan(
@@ -74,9 +87,16 @@ async def launch_plan(
             },
             timeout=120,
         )
-    except BaseException:
-        ctx.ledger.set_state(row.id, "deleted")
+    except asyncio.CancelledError:
+        # The request may have reached Lens; get_deployment reconciles the row by provenance.ledger_id.
         raise
+    except LensApiError as error:
+        if 400 <= error.status < 500:
+            ctx.ledger.set_state(row.id, "deleted")
+            raise
+        raise _uncertain(row) from error
+    except Exception as error:
+        raise _uncertain(row) from error
     ctx.ledger.bind_run(row.id, run["id"])
     ctx.ledger.set_state(row.id, "active")
     ctx.ledger.drop_plan(plan_id)

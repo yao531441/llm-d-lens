@@ -13,6 +13,8 @@ MAX_LISTED = 100
 
 
 def _instant(value: str | None) -> datetime | None:
+    if not value:
+        return None
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
@@ -46,11 +48,12 @@ async def delete_orphans(ctx: ToolContext, cluster_id: str, namespaces: list[tup
                 field="namespaces",
                 hint="Call plan_cluster_component(component='orphan-namespaces') for the current candidates.",
             )
-        if _instant(created_at) != listed[name]:
+        given, current = _instant(created_at), listed[name]
+        if given is None or current is None or given != current:
             raise ToolError(
                 "conflict_state",
-                f"'{name}' was created at a different time than given, so it may be a newer namespace reusing the "
-                "name; nothing was deleted.",
+                f"'{name}' cannot be confirmed: its created_at is missing or differs from the one given, so it may be "
+                "a newer namespace reusing the name; nothing was deleted.",
                 field="namespaces",
                 hint="Re-read the candidates and pass the exact created_at.",
             )

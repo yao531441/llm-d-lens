@@ -7,11 +7,10 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from .. import deploy_kind
-from ..cluster_info import cluster_summary
 from ..context import ToolContext
 from ..deploy_create import DEFAULT_TTL_HOURS, expires_at, launch_plan
 from ..deploy_recommend import recommend
-from ..deploy_spec import DeploymentSpec, gpus_total, parse_spec, plan_params, spec_from_deployment
+from ..deploy_spec import DeploymentSpec, spec_from_deployment
 from ..deploy_status import iso
 from ..deployment_refs import get_run, latest_case, require_owned, resolve
 from ..errors import ToolError
@@ -273,30 +272,35 @@ def _conflict(error: LensApiError, hint: str) -> ToolError:
 async def stop_deployment(ctx: ToolContext, args: DeploymentIdArgs) -> dict[str, Any]:
     ref = await resolve(ctx, args.deployment_id)
     row = require_owned(ref, args.deployment_id, "stopped")
+    if users := await deploy_kind.borrowers(ctx, row):
+        raise deploy_kind.borrowed_error(row.id, users)
     case = await _case(ctx, ref.run_id)
     if case.get("status") == "stopped":
         return {"deployment_id": row.id, "status": "stopped", "already_stopped": True}
     try:
-        await ctx.api.request("PATCH", f"/deployments/runs/{ref.run_id}/cases/{case['id']}/stop", timeout=300)
+        await ctx.api.request("POST", f"/deployments/runs/{ref.run_id}/cases/{case['id']}/stop", timeout=300)
     except LensApiError as error:
         if error.status == 409:
-            raise _conflict(error, "Lens needs an active cluster session; reconnect the cluster and retry.") from error
+            raise _conflict(
+                error,
+                "Lens needs an active session for this cluster and a running execution; reconnect the cluster or "
+                "wait for the deployment to start (get_deployment), then retry.",
+            ) from error
         raise
     return {
         "deployment_id": row.id,
         "status": "stopped",
-        "next": "restart_deployment resumes it; delete_resources removes it for good.",
+        "next": "delete_resources removes it for good; create_deployment(from_deployment_id=...) makes a new copy.",
     }
 
 
 @tool(
     "restart_deployment",
-    "[S] Bring a stopped or failed deployment you created back up from its stored spec. Lens recreates the "
-    "namespace, so the deployment_id stays the same but the endpoint and pods are new. Use get_deployment("
-    "include=['restart_check']) to see whether the accelerators are free; a running deployment cannot be "
-    "restarted, stop_deployment it first.\n"
-    "Side effects: cleans the old namespace and creates new pods; resources: accelerators while running; "
-    "duration: returns in seconds, ready after minutes; reversible: yes (stop_deployment).",
+    "[S] Bring a stopped or failed deployment you created back up. Currently unavailable: Lens' restart cleans the "
+    "namespace and then rejects its own retry, so this tool refuses without touching anything. Use "
+    "create_deployment(from_deployment_id=...) for a fresh copy of the same spec instead, after stop_deployment "
+    "or delete_resources on the old one.\n"
+    "Side effects: none while Lens restart is broken; resources: none; duration: synchronous; reversible: n/a.",
     DeploymentIdArgs,
     read_only=False,
     idempotent=True,
@@ -312,37 +316,15 @@ async def restart_deployment(ctx: ToolContext, args: DeploymentIdArgs) -> dict[s
             field="deployment_id",
             hint="Call stop_deployment first, or get_deployment to see its status.",
         )
-    spec = row.meta.get("spec")
-    if spec and row.cluster_id:
-        needed = gpus_total(plan_params(parse_spec(spec)))
-        free = (await cluster_summary(ctx, row.cluster_id)).get("accelerators_free")
-        if free is not None and needed > free:
-            raise ToolError(
-                "insufficient_capacity",
-                f"Restart needs {needed} accelerators but only {free} are free.",
-                field="deployment_id",
-                hint="Free accelerators with stop_deployment or delete_resources, then retry.",
-            )
-    try:
-        await ctx.api.request(
-            "POST",
-            f"/deployments/runs/{ref.run_id}/cases/{case['id']}/restart",
-            body={"model_token": None},
-            timeout=300,
-        )
-    except LensApiError as error:
-        if error.status == 409:
-            raise _conflict(
-                error, "Lens could not clean the old namespace; check the cluster session and retry."
-            ) from error
-        raise
-    ctx.ledger.update_meta(row.id, {"restarting_from": ref.execution_id})
-    return {
-        "deployment_id": row.id,
-        "status": "pending",
-        "note": "The restart creates a new Lens execution; the deployment_id is unchanged.",
-        "next": f"Call get_deployment(deployment_id='{row.id}', wait_seconds=25) until status is ready.",
-    }
+    # Lens (deploy/worker.py restart_case) marks the case CLEANED and then asks retry_case, which only accepts
+    # FAILED or STOPPED cases, so every restart would destroy the namespace and then fail.
+    raise ToolError(
+        "conflict_state",
+        "Lens cannot restart this deployment: its restart removes the namespace and then rejects the retry.",
+        field="deployment_id",
+        hint=f"Call create_deployment(from_deployment_id='{row.id}') for a new deployment with the same spec "
+        "(delete the old one with delete_resources when it is no longer needed).",
+    )
 
 
 register_kind(

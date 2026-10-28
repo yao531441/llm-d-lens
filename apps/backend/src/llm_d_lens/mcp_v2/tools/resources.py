@@ -126,8 +126,6 @@ async def delete_resources(ctx: ToolContext, args: DeleteResourcesInput) -> dict
                 hint="Re-run list_resources and pass the ids and names you actually mean.",
             )
     results = [await _delete_one(ctx, resource_id, rows[resource_id], args.cascade) for resource_id in args.ids]
-    if len(args.ids) > 1:
-        ctx.ledger.record_action(ctx.owner, "destructive", len(args.ids) - 1)
     return {
         "results": results,
         "deleted": [item["id"] for item in results if item["status"] == "deleted"],
@@ -180,6 +178,9 @@ async def _delete_one(ctx: ToolContext, resource_id: str, row: Resource | None, 
     except LensApiError as error:
         ctx.ledger.set_state(row.id, previous)
         return outcome("failed", error=error.code() or f"lens_{error.status}", message=error.message())
+    except Exception as error:  # noqa: BLE001 - leave the row retryable and report which id failed
+        ctx.ledger.set_state(row.id, previous)
+        return outcome("failed", error="upstream_unavailable", message=f"{type(error).__name__}: {error}"[:300])
     for child in ctx.ledger.children(row.id):
         ctx.ledger.set_state(child.id, "deleted")
     ctx.ledger.set_state(row.id, "deleted")

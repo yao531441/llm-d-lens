@@ -1,5 +1,8 @@
+import asyncio
+
 import pytest
 
+from llm_d_lens.mcp_v2 import experiments_engine as engine
 from llm_d_lens.mcp_v2.context import ToolContext
 from llm_d_lens.mcp_v2.lens_api import LensApiError
 from llm_d_lens.mcp_v2.registry import all_tools, call_tool
@@ -326,3 +329,146 @@ async def test_compare_results_reports_deltas_and_mismatches(api, ctx, lens):
     assert compared["comparison"]["winner_by"]["ttft_ms.p99"] == refs[0]
     missing, is_error = await run(ctx, "compare_results", result_refs=[refs[0], "exp-zzzz#v/chat"])
     assert is_error and missing["error"]["code"] == "not_found"
+
+
+def lease_key(experiment_id: str) -> str:
+    return f"exp:{experiment_id}"
+
+
+@pytest.mark.asyncio
+async def test_another_session_holding_the_lease_prevents_advancing(api, ctx, lens, monkeypatch):
+    monkeypatch.setattr(engine, "LEASE_WAIT_SECONDS", 0)
+    experiment_id = await start_spec(ctx)
+    assert ctx.ledger.acquire_lease(lease_key(experiment_id), "other-session", 60)
+    lens.exec_status = "ready"
+    view, is_error = await run(ctx, "get_experiment", experiment_id=experiment_id)
+    assert not is_error and view["advancing_elsewhere"] and "last persisted state" in view["note"]
+    assert api.called("POST", "/evaluate/runs") == []
+    cancelled, is_error = await run(ctx, "cancel_experiment", experiment_id=experiment_id)
+    assert is_error and cancelled["error"]["code"] == "conflict_state"
+    ctx.ledger.release_lease(lease_key(experiment_id), "other-session")
+    resumed, _ = await run(ctx, "get_experiment", experiment_id=experiment_id)
+    assert "advancing_elsewhere" not in resumed and len(api.called("POST", "/evaluate/runs")) == 1
+    assert ctx.ledger.acquire_lease(lease_key(experiment_id), "next", 60)
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_create_is_reconciled_by_ledger_id_not_duplicated(api, ctx, lens):
+    api.on("POST", "/deployments/runs", TimeoutError("read timed out"))
+    experiment_id = await start_spec(ctx)
+    (dep,) = ctx.ledger.children(experiment_id)
+    assert dep.state == "creating" and dep.lens_run_id is None
+    view, _ = await run(ctx, "get_experiment", experiment_id=experiment_id)
+    assert view["variants"][0]["deployment_state"] == "creating" and len(api.called("POST", "/deployments/runs")) == 1
+    api.on("GET", "/deployments/runs", [{"id": "run-1", "provenance": {"ledger_id": dep.id}}])
+    lens.exec_status = "ready"
+    await run(ctx, "get_experiment", experiment_id=experiment_id)
+    bound = ctx.ledger.get(dep.id)
+    assert bound.lens_run_id == "run-1" and bound.state == "active"
+    assert len(api.called("POST", "/deployments/runs")) == 1 and len(api.called("POST", "/evaluate/runs")) == 1
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_create_is_retried_only_after_the_grace_period(api, ctx, lens, monkeypatch):
+    api.on("POST", "/deployments/runs", LensApiError(503, {"detail": "unavailable"}, "POST", "/deployments/runs"))
+    experiment_id = await start_spec(ctx)
+    (first,) = ctx.ledger.children(experiment_id)
+    assert first.state == "creating"
+    api.on("POST", "/deployments/runs", {"id": "run-1", "status": "queued", "cases": []})
+    await run(ctx, "get_experiment", experiment_id=experiment_id)
+    assert len(api.called("POST", "/deployments/runs")) == 1
+    api.on("GET", "/deployments/runs", [])
+    monkeypatch.setattr(engine, "CREATE_RECONCILE_SECONDS", -1)
+    await run(ctx, "get_experiment", experiment_id=experiment_id)
+    assert ctx.ledger.get(first.id).state == "deleted" and len(api.called("POST", "/deployments/runs")) == 2
+    (second,) = ctx.ledger.children(experiment_id)
+    assert second.id != first.id and second.state == "active"
+
+
+@pytest.mark.asyncio
+async def test_definite_rejection_marks_the_row_deleted_and_fails_the_variant(api, ctx, lens):
+    api.on("POST", "/deployments/runs", LensApiError(422, {"detail": "bad config"}, "POST", "/deployments/runs"))
+    experiment_id = await start_spec(ctx)
+    assert ctx.ledger.children(experiment_id) == []
+    view, _ = await run(ctx, "get_experiment", experiment_id=experiment_id)
+    assert view["state"]["execution"] == "failed" and view["variants"][0]["deployment_state"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_create_keeps_the_row_and_resumes_without_a_duplicate(api, ctx, lens):
+    def interrupted(params, body):
+        raise asyncio.CancelledError
+
+    api.on("POST", "/deployments/runs", interrupted)
+    with pytest.raises(asyncio.CancelledError):
+        await call_tool(ctx, "start_experiment", {"cluster_id": "c1", "variants": [SPEC_VARIANT]})
+    (experiment,) = ctx.ledger.list_resources(owner=ctx.owner, kind="experiment")
+    (dep,) = ctx.ledger.children(experiment.id)
+    assert dep.state == "creating" and ctx.ledger.acquire_lease(lease_key(experiment.id), "after", 60)
+    ctx.ledger.release_lease(lease_key(experiment.id), "after")
+    api.on("POST", "/deployments/runs", {"id": "run-1", "status": "queued", "cases": []})
+    api.on("GET", "/deployments/runs", [{"id": "run-1", "provenance": {"ledger_id": dep.id}}])
+    await run(ctx, "get_experiment", experiment_id=experiment.id)
+    assert ctx.ledger.get(dep.id).lens_run_id == "run-1"
+    assert len(api.called("POST", "/deployments/runs")) == 1
+
+
+@pytest.mark.asyncio
+async def test_partial_cancel_keeps_the_deployment_the_user_asked_to_keep(api, ctx, lens):
+    borrowed = borrow(ctx, api)
+    payload, is_error = await run(
+        ctx,
+        "start_experiment",
+        cluster_id="c1",
+        variants=[SPEC_VARIANT, {"variant_id": "mine", "deployment_id": borrowed}],
+    )
+    assert not is_error, payload
+    experiment_id = payload["experiment_id"]
+    (dep,) = ctx.ledger.children(experiment_id)
+    lens.exec_status = "ready"
+    await run(ctx, "get_experiment", experiment_id=experiment_id)
+    cancelled, is_error = await run(
+        ctx, "cancel_experiment", experiment_id=experiment_id, variant_ids=["base"], keep_deployments=True
+    )
+    assert not is_error, cancelled
+    assert api.called("DELETE", "/deployments/executions/exec-1") == []
+    meta = ctx.ledger.get(experiment_id).meta
+    assert meta["variants"]["base"]["cleanup"] == "kept" and meta["cancel"] is None
+    kept = ctx.ledger.get(dep.id)
+    assert kept.state == "active" and kept.root_id == dep.id and ctx.ledger.children(experiment_id) == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_that_lens_never_confirms_is_closed_locally_after_the_timeout(api, ctx, lens, monkeypatch):
+    monkeypatch.setattr(engine, "CANCEL_WAIT_SECONDS", 0)
+    experiment_id = await start_spec(ctx)
+    lens.exec_status = "ready"
+    await run(ctx, "get_experiment", experiment_id=experiment_id)
+    lens.cancel = lambda run_id: {"status": "cancelling"}
+    pending, _ = await run(ctx, "cancel_experiment", experiment_id=experiment_id)
+    assert pending["state"]["execution"] == "cancelling" and not pending["cancelled"]
+    monkeypatch.setattr(engine, "CANCEL_TIMEOUT_SECONDS", -1)
+    closed, _ = await run(ctx, "get_experiment", experiment_id=experiment_id)
+    assert closed["state"]["execution"] == "cancelled" and "marked cancelled locally" in closed["warnings"][0]
+    api.on("DELETE", "/evaluate/runs/ev-1", LensApiError(409, {"detail": "still running"}, "DELETE", "x"))
+    deleted, is_error = await run(ctx, "delete_resources", ids=[experiment_id])
+    assert not is_error and deleted["deleted"] == [experiment_id]
+
+
+@pytest.mark.asyncio
+async def test_start_returns_the_experiment_id_even_if_the_first_step_breaks(api, ctx, lens, monkeypatch):
+    original = engine._reconcile
+    calls = []
+
+    async def flaky(ctx, s):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("boom")
+        await original(ctx, s)
+
+    monkeypatch.setattr(engine, "_reconcile", flaky)
+    payload, is_error = await run(ctx, "start_experiment", cluster_id="c1", variants=[SPEC_VARIANT])
+    assert not is_error and payload["started"] and "boom" in payload["advance_error"]
+    assert api.called("POST", "/deployments/runs") == []
+    resumed, _ = await run(ctx, "get_experiment", experiment_id=payload["experiment_id"])
+    assert len(api.called("POST", "/deployments/runs")) == 1 and resumed["variants"][0]["deployment_id"]

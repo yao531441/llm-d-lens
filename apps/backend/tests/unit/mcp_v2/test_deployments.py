@@ -1,6 +1,8 @@
+import asyncio
+
 import pytest
 
-from llm_d_lens.mcp_v2 import deploy_test
+from llm_d_lens.mcp_v2 import deploy_test, deployment_refs
 from llm_d_lens.mcp_v2.context import ToolContext
 from llm_d_lens.mcp_v2.lens_api import LensApiError
 from llm_d_lens.mcp_v2.planning import serving_image
@@ -194,12 +196,64 @@ async def test_create_requires_exactly_one_source_and_bounded_ttl(api, ctx):
 
 
 @pytest.mark.asyncio
-async def test_failed_create_leaves_no_live_ledger_row(api, ctx):
+async def test_create_rejected_by_lens_with_4xx_leaves_no_live_ledger_row(api, ctx):
     plan_routes(api)
-    api.on("POST", "/deployments/runs", LensApiError(500, {"detail": "boom"}, "POST", "/deployments/runs"))
+    api.on("POST", "/deployments/runs", LensApiError(422, {"detail": "bad manifest"}, "POST", "/deployments/runs"))
     payload, is_error = await call_tool(ctx, "create_deployment", {"spec": SPEC})
-    assert is_error
+    assert is_error and payload["error"]["code"] != "upstream_unavailable"
     assert ctx.ledger.list_resources(owner=ctx.owner, kind="deployment") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure", [LensApiError(502, {"detail": "gateway"}, "POST", "/deployments/runs"), TimeoutError()]
+)
+async def test_create_with_uncertain_outcome_keeps_the_row_and_reconciles_by_provenance(api, ctx, failure):
+    plan_routes(api)
+    api.on("POST", "/deployments/runs", failure)
+    payload, is_error = await call_tool(ctx, "create_deployment", {"spec": SPEC})
+    assert is_error and payload["error"]["code"] == "upstream_unavailable"
+    deployment_id = payload["error"]["deployment_id"]
+    assert "get_deployment" in payload["error"]["hint"]
+    assert ctx.ledger.get(deployment_id).state == "creating"
+
+    # Lens never recorded a run: still waiting inside the grace period.
+    api.on("GET", "/deployments/runs", [])
+    got, _ = await call_tool(ctx, "get_deployment", {"deployment_id": deployment_id})
+    assert got["status"] == "pending" and ctx.ledger.get(deployment_id).state == "creating"
+
+    # The run exists after all: it is matched through provenance.ledger_id and bound.
+    api.on("GET", "/deployments/runs", [{"id": "run-9", "provenance": {"ledger_id": deployment_id}}])
+    api.on("GET", "/deployments/runs/run-9", {"id": "run-9", "cases": [lens_case("deploying", None)]})
+    got, _ = await call_tool(ctx, "get_deployment", {"deployment_id": deployment_id})
+    row = ctx.ledger.get(deployment_id)
+    assert row.state == "active" and row.lens_run_id == "run-9" and got["status"] == "starting"
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_create_that_never_appears_in_lens_is_dropped_after_the_grace_period(api, ctx, monkeypatch):
+    plan_routes(api)
+    api.on("POST", "/deployments/runs", TimeoutError())
+    payload, _ = await call_tool(ctx, "create_deployment", {"spec": SPEC})
+    deployment_id = payload["error"]["deployment_id"]
+    api.on("GET", "/deployments/runs", [])
+    monkeypatch.setattr(deployment_refs, "CREATE_GRACE_SECONDS", -1)
+    got, _ = await call_tool(ctx, "get_deployment", {"deployment_id": deployment_id})
+    assert got["status"] == "deleted" and ctx.ledger.get(deployment_id).state == "deleted"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_create_leaves_the_row_creating(api, ctx):
+    plan_routes(api)
+
+    def cancelled(params, body):
+        raise asyncio.CancelledError
+
+    api.on("POST", "/deployments/runs", cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        await call_tool(ctx, "create_deployment", {"spec": SPEC})
+    (row,) = ctx.ledger.list_resources(owner=ctx.owner, kind="deployment")
+    assert row.state == "creating"
 
 
 @pytest.mark.asyncio
@@ -353,29 +407,29 @@ async def test_update_rejects_empty_changes_and_out_of_range_ttl(api, ctx):
         assert is_error and payload["error"]["code"] == "invalid_argument"
 
 
+STOP = "/deployments/runs/run-1/cases/case-1/stop"
+
+
 @pytest.mark.asyncio
-async def test_stop_patches_latest_case_and_is_idempotent(api, ctx):
+async def test_stop_posts_to_the_latest_case_and_is_idempotent(api, ctx):
     deployment_id = await create(api, ctx)
-    api.on("PATCH", "/deployments/runs/run-1/cases/case-1/stop", {})
+    api.on("POST", STOP, {})
     stopped, is_error = await call_tool(ctx, "stop_deployment", {"deployment_id": deployment_id})
     assert not is_error and stopped["status"] == "stopped"
-    assert len(api.called("PATCH", "/deployments/runs/run-1/cases/case-1/stop")) == 1
+    # The Lens route is POST; any other method on this path is a bug.
+    assert [method for method, path, _ in api.calls if path == STOP] == ["POST"]
     lens_state(api, status="rolled_back", case_status="stopped")
     again, _ = await call_tool(ctx, "stop_deployment", {"deployment_id": deployment_id})
     assert again["already_stopped"] is True
-    assert len(api.called("PATCH", "/deployments/runs/run-1/cases/case-1/stop")) == 1
+    assert len(api.called("POST", STOP)) == 1
 
 
 @pytest.mark.asyncio
-async def test_stop_without_cluster_session_is_a_conflict(api, ctx):
+async def test_stop_conflict_from_lens_is_actionable(api, ctx):
     deployment_id = await create(api, ctx)
-    api.on(
-        "PATCH",
-        "/deployments/runs/run-1/cases/case-1/stop",
-        LensApiError(409, {"detail": "no active cluster session"}, "PATCH", "stop"),
-    )
+    api.on("POST", STOP, LensApiError(409, {"detail": "no active cluster session"}, "POST", STOP))
     payload, is_error = await call_tool(ctx, "stop_deployment", {"deployment_id": deployment_id})
-    assert is_error and payload["error"]["code"] == "conflict_state"
+    assert is_error and payload["error"]["code"] == "conflict_state" and payload["error"]["hint"]
 
 
 @pytest.mark.asyncio
@@ -383,30 +437,26 @@ async def test_restart_requires_stopped_or_failed(api, ctx):
     deployment_id = await create(api, ctx)
     payload, is_error = await call_tool(ctx, "restart_deployment", {"deployment_id": deployment_id})
     assert is_error and payload["error"]["code"] == "conflict_state"
+    assert "stop_deployment" in payload["error"]["hint"]
 
 
 @pytest.mark.asyncio
-async def test_restart_checks_capacity_first(api, ctx):
-    deployment_id = await create(api, ctx, {**SPEC, "topology": {"serving": {"replicas": 30}}})
+async def test_restart_never_calls_the_broken_lens_restart_and_points_to_a_rebuild(api, ctx):
+    # Lens restart_case cleans the namespace, marks the case CLEANED, then retry_case rejects it.
+    deployment_id = await create(api, ctx)
     lens_state(api, status="rolled_back", case_status="stopped")
     api.on("POST", "/deployments/runs/run-1/cases/case-1/restart", {})
     payload, is_error = await call_tool(ctx, "restart_deployment", {"deployment_id": deployment_id})
-    assert is_error and payload["error"]["code"] == "insufficient_capacity"
+    assert is_error and payload["error"]["code"] == "conflict_state"
+    assert f"from_deployment_id='{deployment_id}'" in payload["error"]["hint"]
     assert api.called("POST", "/deployments/runs/run-1/cases/case-1/restart") == []
 
 
 @pytest.mark.asyncio
-async def test_restart_keeps_id_and_rebinds_to_the_new_execution(api, ctx):
+async def test_ledger_rebinds_to_the_new_execution_after_a_lens_retry(api, ctx):
     deployment_id = await create(api, ctx)
     ctx.ledger.bind_execution(deployment_id, EXEC)
-    lens_state(api, status="rolled_back", case_status="stopped")
-    api.on("POST", "/deployments/runs/run-1/cases/case-1/restart", {"case": lens_case("queued", None, attempt=2)})
-    restarted, is_error = await call_tool(ctx, "restart_deployment", {"deployment_id": deployment_id})
-    assert not is_error, restarted
-    assert restarted["deployment_id"] == deployment_id and restarted["status"] == "pending"
-    assert api.called("POST", "/deployments/runs/run-1/cases/case-1/restart") == [{"model_token": None}]
-
-    # Until Lens gives the new case its own execution, the old execution must not be reported.
+    ctx.ledger.update_meta(deployment_id, {"restarting_from": EXEC})
     api.on(
         "GET",
         "/deployments/runs/run-1",
@@ -424,6 +474,42 @@ async def test_restart_keeps_id_and_rebinds_to_the_new_execution(api, ctx):
     got, _ = await call_tool(ctx, "get_deployment", {"deployment_id": deployment_id})
     assert got["deployment_id"] == deployment_id and got["status"] == "starting"
     assert ctx.ledger.get(deployment_id).lens_execution_id == "exec-2"
+
+
+def borrowing_experiment(ctx, deployment_id, *, phase="running"):
+    return ctx.ledger.add_resource(
+        kind="experiment",
+        owner=ctx.owner,
+        cluster_id="c1",
+        name="exp",
+        meta={"phase": phase, "variants": {"a": {"deploy": "borrowed", "dep_id": deployment_id}}},
+    )
+
+
+@pytest.mark.asyncio
+async def test_running_experiment_borrowing_a_deployment_blocks_stop_and_delete(api, ctx):
+    deployment_id = await create(api, ctx)
+    ctx.ledger.bind_execution(deployment_id, EXEC)
+    api.on("POST", STOP, {})
+    api.on("DELETE", f"/deployments/executions/{EXEC}", {})
+    experiment = borrowing_experiment(ctx, deployment_id)
+
+    payload, is_error = await call_tool(ctx, "stop_deployment", {"deployment_id": deployment_id})
+    assert is_error and payload["error"]["code"] == "in_use" and "cancel_experiment" in payload["error"]["hint"]
+    assert api.called("POST", STOP) == []
+
+    for cascade in (False, True):
+        payload, _ = await call_tool(ctx, "delete_resources", {"ids": [deployment_id], "cascade": cascade})
+        (result,) = payload["results"]
+        assert result["status"] == "blocked" and result["error"] == "in_use"
+    assert api.called("DELETE", f"/deployments/executions/{EXEC}") == []
+
+    listed, _ = await call_tool(ctx, "list_resources", {"kinds": ["deployment"], "include": ["dependents"]})
+    assert [d["id"] for d in listed["resources"][0]["dependents"]] == [experiment.id]
+
+    ctx.ledger.update_meta(experiment.id, {"phase": "settled"})
+    payload, _ = await call_tool(ctx, "delete_resources", {"ids": [deployment_id]})
+    assert payload["results"][0]["status"] == "deleted"
 
 
 # kind: delete / list_others ------------------------------------------------------------------------------------
@@ -462,6 +548,22 @@ async def test_delete_in_use_deployment_is_blocked_not_deleted(api, ctx):
     )
     payload, is_error = await call_tool(ctx, "delete_resources", {"ids": [deployment_id]})
     assert payload["results"][0]["status"] == "blocked" and ctx.ledger.get(deployment_id).state == "active"
+
+
+@pytest.mark.asyncio
+async def test_delete_409_without_code_is_a_blocked_conflict_with_a_hint(api, ctx):
+    deployment_id = await create(api, ctx)
+    ctx.ledger.bind_execution(deployment_id, EXEC)
+    api.on(
+        "DELETE",
+        f"/deployments/executions/{EXEC}",
+        LensApiError(409, {"detail": "deployment is still running"}, "DELETE", "x"),
+    )
+    payload, _ = await call_tool(ctx, "delete_resources", {"ids": [deployment_id]})
+    (result,) = payload["results"]
+    assert result["status"] == "blocked" and result["error"] == "conflict_state"
+    assert "stop_deployment" in result["message"]
+    assert ctx.ledger.get(deployment_id).state == "active"
 
 
 @pytest.mark.asyncio

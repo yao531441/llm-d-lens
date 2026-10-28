@@ -266,8 +266,18 @@ async def start_experiment(ctx: ToolContext, args: StartExperimentInput) -> dict
     )
     ctx.ledger.update_meta(row.id, initial_state(row.id, design, plan_id, unit_seconds))
     ctx.ledger.set_state(row.id, "active")
-    row = await advance(ctx, row.id) or row
-    return {"started": True, **build_view(row, [])}
+    # From here the experiment row exists, so a failed first step must not hide the exp- id: the next poll resumes it.
+    first_step_error = None
+    try:
+        row = (await advance(ctx, row.id))[0] or row
+    except Exception as error:  # noqa: BLE001
+        first_step_error = str(error)[:300]
+        row = ctx.ledger.get(row.id) or row
+    view = {"started": True, **build_view(row, [])}
+    if first_step_error:
+        view["advance_error"] = first_step_error
+        view["next"] = "Call get_experiment to resume the experiment; its state is persisted."
+    return view
 
 
 @tool(
@@ -289,9 +299,11 @@ async def get_experiment(ctx: ToolContext, args: GetExperimentInput) -> dict[str
     if "phase" not in row.meta:
         raise ToolError("conflict_state", f"{row.id} is still being created.", hint="Retry in a few seconds.")
     mine = row.owner == ctx.owner
+    contended = False
     if mine:
-        row = await wait_for_change(ctx, row.id, args.wait_seconds, args.wait_until) or row
-    return build_view(row, list(args.include), is_mine=mine)
+        advanced, contended = await wait_for_change(ctx, row.id, args.wait_seconds, args.wait_until)
+        row = advanced or row
+    return build_view(row, list(args.include), is_mine=mine, contended=contended)
 
 
 @tool(

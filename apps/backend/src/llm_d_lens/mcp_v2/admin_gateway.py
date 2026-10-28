@@ -47,8 +47,15 @@ async def _gateway_target(ctx: ToolContext, cluster_id: str) -> tuple[str, str]:
             f"Replica changes are only supported for the istio provider, not '{cluster.get('gatewayProvider')}'.",
             field="replicas",
         )
-    namespace = cluster["gatewayNamespace"]
-    return namespace, f"{cluster['gatewayName']}-istio"
+    namespace, gateway_name = cluster.get("gatewayNamespace"), cluster.get("gatewayName")
+    if not namespace or not gateway_name:
+        raise ToolError(
+            "conflict_state",
+            f"Lens did not report the gateway namespace and name for cluster {cluster_id}; nothing was changed.",
+            field="cluster_id",
+            hint="Run plan_cluster_component(component='model-gateway') and reconcile or reinstall the gateway.",
+        )
+    return namespace, f"{gateway_name}-istio"
 
 
 async def configure_gateway(

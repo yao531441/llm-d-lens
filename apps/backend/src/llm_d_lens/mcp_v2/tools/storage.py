@@ -15,8 +15,11 @@ from ..registry import tool
 from ..storage_ops import (
     VOLUMES,
     VolumeRef,
+    is_definite_failure,
     load_entries,
     load_volume,
+    outcome_unknown,
+    reconcile_volume,
     require_owned,
     resolve_volume,
     volume_view,
@@ -84,6 +87,17 @@ async def create_storage_volume(ctx: ToolContext, args: CreateVolumeArgs) -> dic
     path = check_host_path(args.path) if args.kind == "local-disk" else args.path
     existing = (await ctx.api.request("GET", VOLUMES, params={"cluster_id": args.cluster_id})).get("items") or []
     if any(item["name"].lower() == args.name.lower() for item in existing):
+        for pending in ctx.ledger.list_resources(owner=ctx.owner, kind="storage_volume", cluster_id=args.cluster_id):
+            if pending.state == "creating" and not pending.lens_execution_id and pending.name == args.name:
+                confirmed = await reconcile_volume(ctx, pending)
+                if confirmed.lens_execution_id:
+                    raise ToolError(
+                        "already_exists",
+                        f"Your earlier create of '{args.name}' did complete: it is volume {confirmed.id}.",
+                        field="name",
+                        hint=f"Use get_storage_volume(volume_id='{confirmed.id}').",
+                        volume_id=confirmed.id,
+                    )
         raise ToolError(
             "already_exists",
             f"A storage volume named '{args.name}' already exists on this cluster.",
@@ -118,13 +132,14 @@ async def create_storage_volume(ctx: ToolContext, args: CreateVolumeArgs) -> dic
             },
             timeout=120,
         )
-    except LensApiError as error:
+    except asyncio.CancelledError:
+        raise  # the request may have reached Lens; keep the row so get_storage_volume can reconcile it
+    except Exception as error:
+        if not is_definite_failure(error):
+            raise outcome_unknown(row, error) from error
         ctx.ledger.set_state(row.id, "deleted")
-        if error.status == 409:
+        if isinstance(error, LensApiError) and error.status == 409:
             raise ToolError("already_exists", error.message(), field="name") from error
-        raise
-    except BaseException:
-        ctx.ledger.set_state(row.id, "deleted")
         raise
     ctx.ledger.bind_execution(row.id, volume["id"])
     ctx.ledger.set_state(row.id, "active")

@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS audit (
     is_error INTEGER NOT NULL,
     summary TEXT
 );
+CREATE TABLE IF NOT EXISTS leases (key TEXT PRIMARY KEY, holder TEXT NOT NULL, expires_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS plans (
     plan_id TEXT PRIMARY KEY,
     owner TEXT NOT NULL,
@@ -254,6 +255,23 @@ class Ledger:
             (owner, bucket, time.time() - window_seconds),
         )
         return int(rows[0]["n"])
+
+    def acquire_lease(self, key: str, holder: str, ttl_seconds: float = 60) -> bool:
+        """Cross-process mutex: True if ``holder`` now owns ``key`` (re-entrant for the same holder)."""
+        now = time.time()
+        with self._lock, self._db:
+            self._db.execute("BEGIN IMMEDIATE")
+            row = self._db.execute("SELECT holder, expires_at FROM leases WHERE key = ?", (key,)).fetchone()
+            if row and row["holder"] != holder and row["expires_at"] > now:
+                return False
+            self._db.execute(
+                "INSERT OR REPLACE INTO leases (key, holder, expires_at) VALUES (?,?,?)",
+                (key, holder, now + ttl_seconds),
+            )
+            return True
+
+    def release_lease(self, key: str, holder: str) -> None:
+        self._write("DELETE FROM leases WHERE key = ? AND holder = ?", (key, holder))
 
     def audit(self, owner: str, tool: str, arguments: dict[str, Any], is_error: bool, summary: str | None) -> None:
         self._write(

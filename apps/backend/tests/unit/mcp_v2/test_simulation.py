@@ -1,3 +1,4 @@
+import asyncio
 import dataclasses
 import itertools
 
@@ -6,6 +7,8 @@ import pytest
 from llm_d_lens.mcp_v2 import simulation_view
 from llm_d_lens.mcp_v2.lens_api import LensApiError
 from llm_d_lens.mcp_v2.registry import call_tool
+
+from .backend_routes import record_route_problems
 
 EXECUTION_ID = "3c42c2b3-32cb-4c9b-8162-366bccdf63ea"
 DATASETS = {
@@ -79,6 +82,13 @@ DONE_TASK = {
         "artifacts": [{"kind": "report", "path": "/var/lib/lens/sim/report.html", "media_type": "text/html"}],
     },
 }
+
+
+@pytest.fixture(autouse=True)
+def backend_routes(api):
+    problems = record_route_problems(api)
+    yield
+    assert not problems, problems
 
 
 @pytest.fixture
@@ -202,6 +212,49 @@ async def test_start_simulation_failure_leaves_no_live_ledger_row_and_blocks_sec
     assert payload["status"] == "queued"
     payload, is_error = await start(sim_ctx, target_id=row.id)
     assert is_error and payload["error"]["code"] == "conflict_state"
+
+
+@pytest.mark.asyncio
+async def test_start_simulation_with_unknown_outcome_keeps_the_record_and_get_simulation_adopts_the_task(api, sim_ctx):
+    row = own_deployment(sim_ctx)
+    sim_routes(api)
+    api.on("POST", "/simulation/tasks", LensApiError(502, {"detail": "bad gateway"}, "POST", "/simulation/tasks"))
+    payload, is_error = await start(sim_ctx, target_id=row.id)
+    assert is_error and payload["error"]["code"] == "upstream_unavailable"
+    simulation_id = payload["error"]["simulation_id"]
+    assert simulation_id in payload["error"]["hint"]
+    assert sim_ctx.ledger.get(simulation_id).state == "creating"
+
+    api.on("GET", "/simulation/tasks", {"tasks": []})
+    payload, is_error = await call_tool(sim_ctx, "get_simulation", {"simulation_id": simulation_id})
+    assert is_error and payload["error"]["code"] == "conflict_state"
+    assert sim_ctx.ledger.get(simulation_id).lens_execution_id is None
+
+    started = {"id": "ab12cd34", "name": sim_ctx.ledger.get(simulation_id).name, "status": "running"}
+    api.on("GET", "/simulation/tasks", {"tasks": [started, {**started, "id": "other"}]})
+    payload, is_error = await call_tool(sim_ctx, "get_simulation", {"simulation_id": simulation_id})
+    assert is_error and sim_ctx.ledger.get(simulation_id).lens_execution_id is None
+
+    api.on("GET", "/simulation/tasks", {"tasks": [started]})
+    payload, is_error = await call_tool(sim_ctx, "get_simulation", {"simulation_id": simulation_id})
+    assert not is_error, payload
+    adopted = sim_ctx.ledger.get(simulation_id)
+    assert adopted.state == "active" and adopted.lens_execution_id == "ab12cd34"
+
+
+@pytest.mark.asyncio
+async def test_start_simulation_cancellation_is_not_swallowed_and_keeps_the_record(api, sim_ctx):
+    row = own_deployment(sim_ctx)
+    sim_routes(api)
+
+    def cancelled(params, body):
+        raise asyncio.CancelledError
+
+    api.on("POST", "/simulation/tasks", cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        await start(sim_ctx, target_id=row.id)
+    (sim,) = sim_ctx.ledger.list_resources(owner=sim_ctx.owner, kind="simulation")
+    assert sim.state == "creating"
 
 
 @pytest.mark.asyncio

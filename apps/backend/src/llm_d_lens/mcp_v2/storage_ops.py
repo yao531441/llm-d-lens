@@ -29,6 +29,41 @@ class VolumeRef:
         return self.row is not None and self.row.state in ("active", "deleting")
 
 
+def is_definite_failure(error: BaseException) -> bool:
+    """True when Lens clearly refused the request, so nothing was created."""
+    if isinstance(error, ToolError):
+        return True
+    return isinstance(error, LensApiError) and 400 <= error.status < 500 and error.status not in (408, 429)
+
+
+def outcome_unknown(row: Resource, error: BaseException) -> ToolError:
+    cause = f"HTTP {error.status}" if isinstance(error, LensApiError) else type(error).__name__
+    return ToolError(
+        "upstream_unavailable",
+        f"Lens did not confirm whether volume '{row.name}' was created ({cause}); it may exist.",
+        hint=f"Wait a moment, then call get_storage_volume(volume_id='{row.id}'); it reconciles by name. "
+        "Do not create the same name again before that.",
+        volume_id=row.id,
+    )
+
+
+async def reconcile_volume(ctx: ToolContext, row: Resource) -> Resource:
+    """Bind an unconfirmed ledger row to the Lens volume with its name on the same cluster, if Lens has one."""
+    if row.lens_execution_id or row.state not in ("creating", "deleting"):
+        return row
+    try:
+        data = await ctx.api.request("GET", VOLUMES, params={"cluster_id": row.cluster_id})
+    except Exception:  # noqa: BLE001 - still unknown; the caller reports it
+        return row
+    for volume in data.get("items") or []:
+        if str(volume.get("name", "")).lower() == (row.name or "").lower():
+            ctx.ledger.bind_execution(row.id, volume["id"])
+            if row.state == "creating":
+                ctx.ledger.set_state(row.id, "active")
+            return ctx.ledger.get(row.id) or row
+    return row
+
+
 def volume_not_found(volume_id: str) -> ToolError:
     return ToolError(
         "not_found",
@@ -42,8 +77,17 @@ async def resolve_volume(ctx: ToolContext, volume_id: str) -> VolumeRef:
     """Accepts a ledger id (``vol-...``) or a raw Lens id (``storage-...``); ownership comes only from the ledger."""
     if volume_id.startswith("vol-"):
         row = ctx.ledger.get(volume_id)
-        if row is None or row.kind != "storage_volume" or row.state == "deleted" or not row.lens_execution_id:
+        if row is None or row.kind != "storage_volume" or row.state == "deleted":
             raise volume_not_found(volume_id)
+        if not row.lens_execution_id and row.owner == ctx.owner:
+            row = await reconcile_volume(ctx, row)
+        if not row.lens_execution_id:
+            raise ToolError(
+                "conflict_state",
+                f"{volume_id} was being created but Lens has not confirmed it, so it may not exist.",
+                field="volume_id",
+                hint="Retry shortly. If it stays unconfirmed, remove the record with delete_resources.",
+            )
         if row.owner != ctx.owner:
             return VolumeRef(None, row.lens_execution_id, foreign_owner=True)
         return VolumeRef(row, row.lens_execution_id)
@@ -178,6 +222,9 @@ def _location(volume: dict[str, Any]) -> str | None:
 
 
 async def describe(ctx: ToolContext, row: Resource) -> dict[str, Any]:
+    row = await reconcile_volume(ctx, row)
+    if not row.lens_execution_id:
+        return {"live_status": "unconfirmed"}
     try:
         volume = await load_volume(ctx, row.lens_execution_id or "")
     except ToolError:
@@ -191,6 +238,7 @@ async def describe(ctx: ToolContext, row: Resource) -> dict[str, Any]:
 
 
 async def dependents(ctx: ToolContext, row: Resource) -> list[dict[str, Any]]:
+    row = await reconcile_volume(ctx, row)
     volume_id = row.lens_execution_id or ""
     try:
         volume = await load_volume(ctx, volume_id)
@@ -220,6 +268,7 @@ async def dependents(ctx: ToolContext, row: Resource) -> list[dict[str, Any]]:
 
 
 async def delete(ctx: ToolContext, row: Resource, cascade: bool) -> None:
+    row = await reconcile_volume(ctx, row)
     volume_id = row.lens_execution_id
     if not volume_id:
         return

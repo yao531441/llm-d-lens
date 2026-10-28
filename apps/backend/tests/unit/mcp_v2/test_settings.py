@@ -6,6 +6,8 @@ from llm_d_lens.mcp_v2.lens_api import LensApiError
 from llm_d_lens.mcp_v2.registry import call_tool
 from llm_d_lens.mcp_v2.tools import settings
 
+from .backend_routes import record_route_problems
+
 PROVIDER = {
     "id": "ai-provider-1a2b3c4d",
     "name": "deepseek",
@@ -16,6 +18,13 @@ PROVIDER = {
     "hasApiKey": True,
     "apiKeyPreview": "sk-…wxyz",
 }
+
+
+@pytest.fixture(autouse=True)
+def backend_routes(api):
+    problems = record_route_problems(api)
+    yield
+    assert not problems, problems
 
 
 @pytest.fixture

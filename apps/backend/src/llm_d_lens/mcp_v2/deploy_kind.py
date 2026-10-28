@@ -12,8 +12,63 @@ from .ledger import Resource
 from .lens_api import LensApiError
 
 
+def _blocked(error: LensApiError) -> ToolError:
+    """A Lens 409 on delete: in use by a consumer when Lens says so, otherwise a state conflict.
+
+    delete_resources reports only code and message, so the advice is part of the message.
+    """
+    if error.code() == "deployment_in_use":
+        return ToolError(
+            "in_use",
+            "An evaluation or another consumer is still using this deployment; wait for it to finish, then delete "
+            "again.",
+            hint="Wait for it to finish, then delete again.",
+        )
+    return ToolError(
+        "conflict_state",
+        f"Lens refused the delete ({error.message()}). Call stop_deployment first and then delete_resources, or "
+        "retry in a minute; get_deployment shows the current status.",
+        hint="stop_deployment first, then delete_resources; or retry later.",
+    )
+
+
+async def borrowers(ctx: ToolContext, row: Resource) -> list[dict[str, Any]]:
+    """Unsettled experiments of this owner that borrow the deployment (they load it with benchmark traffic)."""
+    found = []
+    for experiment in ctx.ledger.list_resources(owner=ctx.owner, kind="experiment"):
+        state = experiment.meta
+        if state.get("phase") == "settled":
+            continue
+        if any(
+            variant.get("deploy") == "borrowed" and variant.get("dep_id") == row.id
+            for variant in (state.get("variants") or {}).values()
+        ):
+            found.append(
+                {
+                    "id": experiment.id,
+                    "kind": "experiment",
+                    "name": experiment.name,
+                    "reason": "borrowed by a running experiment; cancel_experiment it first",
+                }
+            )
+    return found
+
+
+def borrowed_error(row_id: str, users: list[dict[str, Any]]) -> ToolError:
+    ids = ", ".join(user["id"] for user in users)
+    return ToolError(
+        "in_use",
+        f"Deployment {row_id} is used by running experiment(s): {ids}.",
+        field="deployment_id",
+        hint="Call cancel_experiment first (or wait for it to settle), then retry.",
+        dependents=users,
+    )
+
+
 async def delete(ctx: ToolContext, row: Resource, cascade: bool) -> None:
     """Remove the Kubernetes namespace and Lens records. A remote 404 counts as done."""
+    if users := await borrowers(ctx, row):
+        raise borrowed_error(row.id, users)
     ref = await resolve(ctx, row.id)
     try:
         if ref.execution_id:
@@ -33,12 +88,8 @@ async def delete(ctx: ToolContext, row: Resource, cascade: bool) -> None:
     except LensApiError as error:
         if error.status == 404:
             return
-        if error.status == 409 and error.code() == "deployment_in_use":
-            raise ToolError(
-                "in_use",
-                "An evaluation or another consumer is still using this deployment.",
-                hint="Wait for it to finish or stop it, then delete again.",
-            ) from error
+        if error.status == 409:
+            raise _blocked(error) from error
         raise
 
 
@@ -57,11 +108,12 @@ async def describe(ctx: ToolContext, row: Resource) -> dict[str, Any]:
 
 
 async def dependents(ctx: ToolContext, row: Resource) -> list[dict[str, Any]]:
-    """Resources the ledger parents under this deployment. Lens itself reports evaluation use only on delete."""
-    return [
+    """Ledger children plus running experiments that borrow it; Lens reports other consumers only on delete."""
+    children = [
         {"id": child.id, "kind": child.kind, "name": child.name, "reason": "created as part of this deployment"}
         for child in ctx.ledger.children(row.id)
     ]
+    return [*children, *await borrowers(ctx, row)]
 
 
 async def list_others(ctx: ToolContext, cluster_id: str | None) -> list[dict[str, Any]]:

@@ -6,6 +6,7 @@ from llm_d_lens.mcp_v2.lens_api import LensApiError
 from llm_d_lens.mcp_v2.registry import all_tools, call_tool
 
 from .conftest import FakeApi
+from .test_serving import backend_route_check  # noqa: F401  (autouse: calls must match real routes)
 
 SCOPES = frozenset({"core", "serving", "storage"})
 PREFIX_ENV = "LENS_MCP_V2_STORAGE_PATH_PREFIXES"
@@ -309,3 +310,55 @@ async def test_list_others_shows_foreign_volumes_read_only(ctx, lens):
     fresh = ToolContext(api=ctx.api, ledger=Ledger(":memory:"), owner="user-a", scopes=SCOPES)
     listed, _ = await call_tool(fresh, "list_resources", {"kinds": ["storage_volume"], "owner": "all"})
     assert [e["ownership"] for e in listed["resources"]] == ["unknown"]
+
+
+@pytest.mark.asyncio
+async def test_timeout_during_create_keeps_the_row_and_get_reconciles_by_name(api, ctx, lens, monkeypatch):
+    monkeypatch.setenv(PREFIX_ENV, "/mnt/models")
+    lens.volume = None
+
+    def timeout(params, body):
+        lens.create(params, body)  # Lens did create it
+        raise TimeoutError
+
+    api.on("POST", "/storage/volumes", timeout)
+    payload, is_error = await call_tool(ctx, "create_storage_volume", CREATE)
+    assert is_error and payload["error"]["code"] == "upstream_unavailable"
+    volume_id = payload["error"]["volume_id"]
+    assert ctx.ledger.get(volume_id).state == "creating"
+
+    got, is_error = await call_tool(ctx, "get_storage_volume", {"volume_id": volume_id})
+    assert not is_error and got["is_mine"] and got["lens_id"] == "storage-1"
+    row = ctx.ledger.get(volume_id)
+    assert row.state == "active" and row.lens_execution_id == "storage-1"
+
+
+@pytest.mark.asyncio
+async def test_retry_after_unknown_outcome_points_at_the_existing_volume(api, ctx, lens, monkeypatch):
+    monkeypatch.setenv(PREFIX_ENV, "/mnt/models")
+    lens.volume = None
+    row = ctx.ledger.add_resource(
+        kind="storage_volume", owner="user-a", cluster_id="c1", name="fresh", state="creating"
+    )
+    lens.create(
+        None, {"name": "fresh", "kind": "local-disk", "capacity": "100Gi", "localDisk": {"hostPath": "/mnt/models/new"}}
+    )
+    payload, is_error = await call_tool(ctx, "create_storage_volume", CREATE)
+    assert is_error and payload["error"]["code"] == "already_exists" and payload["error"]["volume_id"] == row.id
+    assert ctx.ledger.get(row.id).state == "active"
+
+
+@pytest.mark.asyncio
+async def test_create_discards_the_row_only_on_a_clear_client_error(api, ctx, lens, monkeypatch):
+    monkeypatch.setenv(PREFIX_ENV, "/mnt/models")
+    lens.volume = None
+    api.on("POST", "/storage/volumes", LensApiError(503, {"detail": "down"}, "POST", ""))
+    payload, is_error = await call_tool(ctx, "create_storage_volume", CREATE)
+    assert is_error and payload["error"]["code"] == "upstream_unavailable"
+    assert [r.state for r in ctx.ledger.list_resources(owner="user-a", kind="storage_volume")] == ["creating"]
+    api.on("POST", "/storage/volumes", LensApiError(422, {"detail": "bad"}, "POST", ""))
+    payload, is_error = await call_tool(ctx, "create_storage_volume", {**CREATE, "name": "other"})
+    assert is_error and payload["error"]["code"] != "upstream_unavailable"
+    assert {r.name: r.state for r in ctx.ledger.list_resources(owner="user-a", kind="storage_volume")} == {
+        "fresh": "creating"
+    }

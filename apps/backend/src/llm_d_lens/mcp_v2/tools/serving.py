@@ -23,9 +23,12 @@ from ..serving_ops import (
     connection_info,
     delete,
     gateway_base_url,
+    is_definite_failure,
     lens_write,
     load_service,
+    outcome_unknown,
     owned_deployment_ids,
+    reconcile_service,
     require_owned,
     resolve_service,
     view_of,
@@ -103,6 +106,24 @@ async def _require_free_name(ctx: ToolContext, name: str, cluster_id: str) -> No
     groups = (await ctx.api.request("GET", f"{ADMIN}/groups")).get("items") or []
     for group in groups:
         if group.get("clusterId") == cluster_id and group["name"].lower() == name.lower():
+            pending = next(
+                (
+                    r
+                    for r in ctx.ledger.list_resources(owner=ctx.owner, kind="model_service", cluster_id=cluster_id)
+                    if r.state == "creating" and not r.lens_execution_id and r.name == name
+                ),
+                None,
+            )
+            if pending is not None:
+                confirmed = await reconcile_service(ctx, pending)
+                if confirmed.lens_execution_id:
+                    raise ToolError(
+                        "already_exists",
+                        f"Your earlier publish of '{name}' did complete: it is service {confirmed.id}.",
+                        field="public_name",
+                        hint=f"Use get_model_service(service_id='{confirmed.id}').",
+                        service_id=confirmed.id,
+                    )
             mine = ctx.ledger.find_by_execution(group["id"])
             whose = "one of your services" if mine and mine.owner == ctx.owner else "another service"
             raise ToolError(
@@ -195,14 +216,22 @@ async def publish_model_service(ctx: ToolContext, args: PublishArgs) -> dict[str
             },
             warnings,
         )
-    except BaseException:
-        ctx.ledger.set_state(row.id, "deleted")
-        raise
+    except asyncio.CancelledError:
+        raise  # the request may have reached Lens; keep the row so get_model_service can reconcile it
+    except Exception as error:
+        if is_definite_failure(error):
+            ctx.ledger.set_state(row.id, "deleted")
+            raise
+        raise outcome_unknown(row, error) from error
     if group is None:
-        ctx.ledger.set_state(row.id, "deleted")
-        raise ToolError("upstream_error", "Lens did not return the created service.")
-    ctx.ledger.bind_execution(row.id, group["id"])
-    ctx.ledger.set_state(row.id, "active")
+        # Lens saved the group but could not apply routing yet: the service exists.
+        confirmed = await reconcile_service(ctx, row)
+        if not confirmed.lens_execution_id:
+            raise outcome_unknown(row, RuntimeError("no response body"))
+        group = {"id": confirmed.lens_execution_id}
+    else:
+        ctx.ledger.bind_execution(row.id, group["id"])
+        ctx.ledger.set_state(row.id, "active")
     try:
         for execution_id in others:
             try:
@@ -213,11 +242,11 @@ async def publish_model_service(ctx: ToolContext, args: PublishArgs) -> dict[str
                 raise conflict_error(error) from error
         if others and set(shares.values()) != {1}:
             await _put_traffic(ctx, group["id"], dict.fromkeys(shares, 1), shares, warnings)
-    except BaseException:
+    except Exception:
         try:
             await delete(ctx, ctx.ledger.get(row.id), True)
             ctx.ledger.set_state(row.id, "deleted")
-        except (LensApiError, ToolError):
+        except Exception:  # noqa: BLE001 - report instead of masking the original failure
             warnings.append(f"Partial publish could not be rolled back; delete {row.id} with delete_resources.")
         raise
     ref = ServiceRef(ctx.ledger.get(row.id), group["id"])

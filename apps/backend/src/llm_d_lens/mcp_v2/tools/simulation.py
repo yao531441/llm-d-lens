@@ -297,10 +297,15 @@ async def start_simulation(ctx: ToolContext, args: StartSimulationInput) -> dict
     )
     try:
         created = await ctx.api.request("POST", "/simulation/tasks", body=body, timeout=120)
-    except BaseException:
-        ctx.ledger.set_state(row.id, "deleted")
-        raise
-    ctx.ledger.bind_execution(row.id, created["task_id"])
+        task_id = created["task_id"]
+    except LensApiError as error:
+        if 400 <= error.status < 500:
+            ctx.ledger.set_state(row.id, "deleted")
+            raise
+        raise _outcome_unknown(row.id) from error
+    except Exception as error:
+        raise _outcome_unknown(row.id) from error
+    ctx.ledger.bind_execution(row.id, task_id)
     ctx.ledger.set_state(row.id, "active")
     return {
         "simulation_id": row.id,
@@ -312,6 +317,33 @@ async def start_simulation(ctx: ToolContext, args: StartSimulationInput) -> dict
     }
 
 
+def _outcome_unknown(simulation_id: str) -> ToolError:
+    """The replay may or may not exist in Lens, so the ledger row is kept in ``creating`` instead of deleted."""
+    return ToolError(
+        "upstream_unavailable",
+        "Lens did not confirm whether the simulation was created.",
+        hint=f"Call get_simulation('{simulation_id}') in a minute: it links the record to the replay if it started. "
+        "Do not call start_simulation again until then.",
+        simulation_id=simulation_id,
+    )
+
+
+async def _adopt_unbound(ctx: ToolContext, simulation_id: str) -> None:
+    """Link a ``creating`` record to its Lens task when the create response was lost (single exact name match only)."""
+    row = ctx.ledger.get(simulation_id) if simulation_id.startswith("sim-") else None
+    if row is None or row.kind != "simulation" or row.owner != ctx.owner or row.lens_execution_id:
+        return
+    page = await ctx.api.request("GET", "/simulation/tasks", params={"limit": 100})
+    candidates = [
+        task
+        for task in page.get("tasks") or []
+        if task.get("name") == row.name and ctx.ledger.find_by_execution(task["id"]) is None
+    ]
+    if len(candidates) == 1:
+        ctx.ledger.bind_execution(row.id, candidates[0]["id"])
+        ctx.ledger.set_state(row.id, "active")
+
+
 def _resolve_simulation(ctx: ToolContext, simulation_id: str) -> tuple[str, bool, str | None]:
     """Return ``(lens task id, owned, public id)``; reading another user's task by its Lens id is allowed."""
     if simulation_id.startswith("sim-"):
@@ -321,7 +353,12 @@ def _resolve_simulation(ctx: ToolContext, simulation_id: str) -> tuple[str, bool
         if row.owner != ctx.owner:
             raise ToolError("not_owner", f"{simulation_id} belongs to another user.", field="simulation_id")
         if not row.lens_execution_id:
-            raise ToolError("conflict_state", f"{simulation_id} has not been created in Lens yet.")
+            raise ToolError(
+                "conflict_state",
+                f"{simulation_id} has no confirmed Lens task yet.",
+                hint="Retry get_simulation shortly; if it stays unlinked the replay did not start, so delete the "
+                "record with delete_resources and start again.",
+            )
         return row.lens_execution_id, True, row.id
     row = ctx.ledger.find_by_execution(simulation_id)
     return simulation_id, bool(row and row.owner == ctx.owner), row.id if row else None
@@ -338,6 +375,7 @@ def _resolve_simulation(ctx: ToolContext, simulation_id: str) -> tuple[str, bool
     profile=PROFILE,
 )
 async def get_simulation(ctx: ToolContext, args: GetSimulationInput) -> dict[str, Any]:
+    await _adopt_unbound(ctx, args.simulation_id)
     task_id, owned, public_id = _resolve_simulation(ctx, args.simulation_id)
     task = await wait_for_task(ctx, task_id, args.wait_seconds)
     output: dict[str, Any] = {"simulation_id": public_id or task_id, "owned": owned, **task_summary(task)}

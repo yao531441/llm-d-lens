@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -16,6 +18,8 @@ from .safety import find_secret, redact
 
 PROFILES = ("core", "serving", "storage", "simulation", "cluster-admin", "lens-settings")
 DESTRUCTIVE_PER_HOUR = int(os.environ.get("LENS_MCP_V2_DESTRUCTIVE_PER_HOUR", "100"))
+
+_IN_FLIGHT: set[tuple[str, str, str]] = set()
 
 Handler = Callable[[ToolContext, Any], Awaitable[dict[str, Any]]]
 
@@ -127,6 +131,7 @@ async def _dispatch(ctx: ToolContext, name: str, arguments: dict[str, Any]) -> t
             "(LENS_MCP_V2_PROFILES) if it is really needed.",
         ).payload(), True
     replay_key = None
+    claimed = None
     try:
         args = spec.input_model.model_validate(arguments or {})
         secret = find_secret(arguments or {})
@@ -140,20 +145,42 @@ async def _dispatch(ctx: ToolContext, name: str, arguments: dict[str, Any]) -> t
         if not spec.read_only:
             replay_key = getattr(args, "client_request_id", None)
             if replay_key:
+                fingerprint = hashlib.sha256(
+                    json.dumps(arguments or {}, sort_keys=True, default=str).encode()
+                ).hexdigest()[:16]
                 cached = ctx.ledger.get_idempotent(ctx.owner, name, replay_key)
                 if cached is not None:
-                    return {**cached, "meta": {"idempotent_replay": True}}, False
-            if spec.destructive and ctx.ledger.count_actions(ctx.owner, "destructive") >= DESTRUCTIVE_PER_HOUR:
-                raise ToolError(
-                    "rate_limited",
-                    f"{DESTRUCTIVE_PER_HOUR} destructive operations were already performed in the last hour.",
-                    hint="Wait, or ask the user to do bulk cleanup in the Lens UI.",
-                )
+                    if cached.get("_fingerprint") != fingerprint:
+                        raise ToolError(
+                            "invalid_argument",
+                            "client_request_id was already used with different arguments.",
+                            field="client_request_id",
+                            hint="Use a new client_request_id for a different request.",
+                        )
+                    _audit(ctx, spec, arguments, False, "idempotent replay")
+                    return {**cached["result"], "meta": {"idempotent_replay": True}}, False
+                inflight_key = (ctx.owner, name, replay_key)
+                if inflight_key in _IN_FLIGHT:
+                    raise ToolError(
+                        "conflict_state",
+                        "A request with this client_request_id is still running.",
+                        field="client_request_id",
+                        hint="Wait for it to finish, then retry with the same client_request_id to get its result.",
+                    )
+                _IN_FLIGHT.add(inflight_key)
+                claimed = inflight_key
             if spec.destructive:
-                ctx.ledger.record_action(ctx.owner, "destructive")
+                weight = max(1, len(ids)) if isinstance(ids := getattr(args, "ids", None), list) else 1
+                if ctx.ledger.count_actions(ctx.owner, "destructive") + weight > DESTRUCTIVE_PER_HOUR:
+                    raise ToolError(
+                        "rate_limited",
+                        f"{DESTRUCTIVE_PER_HOUR} destructive operations per hour would be exceeded.",
+                        hint="Wait, or ask the user to do bulk cleanup in the Lens UI.",
+                    )
+                ctx.ledger.record_action(ctx.owner, "destructive", weight)
         result = await spec.handler(ctx, args)
         if replay_key:
-            ctx.ledger.put_idempotent(ctx.owner, name, replay_key, result)
+            ctx.ledger.put_idempotent(ctx.owner, name, replay_key, {"_fingerprint": fingerprint, "result": result})
         _audit(ctx, spec, arguments, False, None)
         return result, False
     except ValidationError as error:
@@ -162,6 +189,14 @@ async def _dispatch(ctx: ToolContext, name: str, arguments: dict[str, Any]) -> t
         failure = error
     except LensApiError as error:
         failure = upstream_error(error)
+    except Exception as error:  # noqa: BLE001 - never leak an unstructured failure to the agent
+        failure = ToolError(
+            "upstream_unavailable" if isinstance(error, (TimeoutError, OSError)) else "internal_error",
+            f"{type(error).__name__}: {error}"[:300],
+            hint="The operation may or may not have completed. Re-check with the matching get_* tool before retrying.",
+        )
+    finally:
+        _IN_FLIGHT.discard(claimed)
     _audit(ctx, spec, arguments, True, failure.message)
     return failure.payload(), True
 

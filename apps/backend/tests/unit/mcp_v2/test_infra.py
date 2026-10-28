@@ -1,6 +1,6 @@
 import pytest
 
-from llm_d_lens.mcp_v2 import kinds
+from llm_d_lens.mcp_v2 import kinds, tools  # noqa: F401 - registers the real kinds before the fake replaces one
 from llm_d_lens.mcp_v2.context import ToolContext
 from llm_d_lens.mcp_v2.errors import ToolError
 from llm_d_lens.mcp_v2.registry import call_tool
@@ -145,3 +145,28 @@ async def test_connection_scopes_gate_tools(api: FakeApi):
     admin = ToolContext(api=api, ledger=Ledger(":memory:"), owner="u", scopes=frozenset({"core", "cluster-admin"}))
     payload, _ = await call_tool(admin, "cordon_nodes", {"nodes": []})
     assert payload.get("error", {}).get("code") != "scope_required"
+
+
+@pytest.mark.asyncio
+async def test_client_request_id_rejects_different_arguments_and_batch_counts_against_the_limit(
+    ctx, fake_kind, monkeypatch
+):
+    from llm_d_lens.mcp_v2 import registry
+
+    row, other = add(ctx, "a"), add(ctx, "b")
+    await call_tool(ctx, "delete_resources", {"ids": [row.id], "client_request_id": "k1"})
+    clash, is_error = await call_tool(ctx, "delete_resources", {"ids": [other.id], "client_request_id": "k1"})
+    assert is_error and clash["error"]["code"] == "invalid_argument"
+    monkeypatch.setattr(registry, "DESTRUCTIVE_PER_HOUR", 3)
+    ids = [add(ctx, f"m{i}").id for i in range(4)]
+    over, is_error = await call_tool(ctx, "delete_resources", {"ids": ids})
+    assert is_error and over["error"]["code"] == "rate_limited"
+
+
+@pytest.mark.asyncio
+async def test_unexpected_delete_failures_are_reported_per_id_and_stay_retryable(ctx, fake_kind):
+    row = add(ctx, "a")
+    fake_kind[2][row.id] = TimeoutError("slow")
+    payload, is_error = await call_tool(ctx, "delete_resources", {"ids": [row.id]})
+    assert not is_error and payload["results"][0]["error"] == "upstream_unavailable"
+    assert ctx.ledger.get(row.id).state == "active"

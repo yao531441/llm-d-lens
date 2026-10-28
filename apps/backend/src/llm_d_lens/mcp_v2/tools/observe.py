@@ -102,6 +102,9 @@ async def _restart_check(ctx: ToolContext, status: str, cluster_id: str | None, 
         "accelerators_needed": needed,
         "accelerators_free": free,
         "fits_now": fits,
+        "restart_available": False,
+        "note": "restart_deployment is unavailable while Lens restart is broken; use create_deployment("
+        "from_deployment_id=...) for a new copy.",
     }
 
 

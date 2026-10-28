@@ -7,6 +7,31 @@ from llm_d_lens.mcp_v2.registry import all_tools, call_tool
 
 from .conftest import FakeApi
 
+
+def backend_routes():
+    from llm_d_lens.model_cache.router import router as cache
+    from llm_d_lens.model_service.router import admin_router
+    from llm_d_lens.model_service.router import router as user
+    from llm_d_lens.storage.router import router as storage
+
+    return [(route.methods, route.path_regex) for r in (user, admin_router, storage, cache) for route in r.routes]
+
+
+def assert_calls_match_backend(api: FakeApi) -> None:
+    """The fake only checks what a test registered, so verify every call against the real FastAPI routes."""
+    routes = backend_routes()
+    for method, path, _ in api.calls:
+        assert any(method in methods and rx.match(f"/api/v1{path}") for methods, rx in routes), (
+            f"backend has no route {method} {path}"
+        )
+
+
+@pytest.fixture(autouse=True)
+def backend_route_check(api):
+    yield
+    assert_calls_match_backend(api)
+
+
 ADMIN = "/model-service/admin"
 SCOPES = frozenset({"core", "serving", "storage"})
 
@@ -461,3 +486,79 @@ async def test_list_others_shows_foreign_services_read_only(api, ctx, lens):
     listed, _ = await call_tool(ctx, "list_resources", {"kinds": ["model_service"], "owner": "all"})
     names = {e["name"]: e["ownership"] for e in listed["resources"]}
     assert names == {"qwen": "owned", "bobs": "unknown"}
+
+
+@pytest.mark.asyncio
+async def test_timeout_during_publish_keeps_the_row_and_get_reconciles_by_name(api, ctx, lens):
+    def timeout(params, body):
+        lens.publish(params, body)  # Lens did create it
+        raise TimeoutError
+
+    api.on("POST", f"{ADMIN}/groups/publish", timeout)
+    dep = add_deployment(ctx, "exec-1")
+    payload, is_error = await call_tool(ctx, "publish_model_service", {"public_name": "qwen", "deployment_ids": [dep]})
+    assert is_error and payload["error"]["code"] == "upstream_unavailable"
+    service = payload["error"]["service_id"]
+    assert "get_model_service" in payload["error"]["hint"]
+    assert ctx.ledger.get(service).state == "creating"
+
+    # a retry of the same name is told the earlier publish succeeded instead of being blocked as foreign
+    again, is_error = await call_tool(ctx, "publish_model_service", {"public_name": "qwen", "deployment_ids": [dep]})
+    assert is_error and again["error"]["code"] == "already_exists" and again["error"]["service_id"] == service
+    row = ctx.ledger.get(service)
+    assert row.state == "active" and row.lens_execution_id == "msg-1"
+    got, is_error = await call_tool(ctx, "get_model_service", {"service_id": service})
+    assert not is_error and got["is_mine"] and got["name"] == "qwen"
+
+
+@pytest.mark.asyncio
+async def test_get_reconciles_an_unconfirmed_row_and_reports_when_lens_has_nothing(api, ctx, lens):
+    row = ctx.ledger.add_resource(kind="model_service", owner="user-a", cluster_id="c1", name="qwen", state="creating")
+    payload, is_error = await call_tool(ctx, "get_model_service", {"service_id": row.id})
+    assert is_error and payload["error"]["code"] == "conflict_state"
+    assert ctx.ledger.get(row.id).state == "creating"
+    lens.publish(None, {"name": "qwen", "clusterId": "c1", "executionId": "exec-1", "description": ""})
+    payload, is_error = await call_tool(ctx, "get_model_service", {"service_id": row.id})
+    assert not is_error and payload["is_mine"]
+    assert ctx.ledger.get(row.id).state == "active"
+
+
+@pytest.mark.asyncio
+async def test_server_error_keeps_the_row_but_a_client_error_discards_it(api, ctx, lens):
+    dep = add_deployment(ctx, "exec-1")
+    api.on("POST", f"{ADMIN}/groups/publish", LensApiError(503, {"detail": "down"}, "POST", ""))
+    payload, is_error = await call_tool(ctx, "publish_model_service", {"public_name": "qwen", "deployment_ids": [dep]})
+    assert is_error and payload["error"]["code"] == "upstream_unavailable"
+    assert [r.state for r in ctx.ledger.list_resources(owner="user-a", kind="model_service")] == ["creating"]
+    api.on("POST", f"{ADMIN}/groups/publish", LensApiError(422, {"detail": "bad"}, "POST", ""))
+    payload, is_error = await call_tool(ctx, "publish_model_service", {"public_name": "qwen2", "deployment_ids": [dep]})
+    assert is_error and payload["error"]["code"] != "upstream_unavailable"
+    states = {r.name: r.state for r in ctx.ledger.list_resources(owner="user-a", kind="model_service")}
+    assert states == {"qwen": "creating"}
+
+
+@pytest.mark.asyncio
+async def test_cancelled_publish_is_reraised_and_keeps_the_row(api, ctx, lens):
+    import asyncio
+
+    def cancel(params, body):
+        raise asyncio.CancelledError
+
+    api.on("POST", f"{ADMIN}/groups/publish", cancel)
+    dep = add_deployment(ctx, "exec-1")
+    with pytest.raises(asyncio.CancelledError):
+        await call_tool(ctx, "publish_model_service", {"public_name": "qwen", "deployment_ids": [dep]})
+    assert [r.state for r in ctx.ledger.list_resources(owner="user-a", kind="model_service")] == ["creating"]
+
+
+@pytest.mark.asyncio
+async def test_saved_but_not_routed_publish_still_binds_the_service(api, ctx, lens):
+    def saved_not_applied(params, body):
+        lens.publish(params, body)
+        raise LensApiError(502, {"code": "model_publication_apply_failed", "detail": "x"}, "POST", "")
+
+    api.on("POST", f"{ADMIN}/groups/publish", saved_not_applied)
+    dep = add_deployment(ctx, "exec-1")
+    payload, is_error = await call_tool(ctx, "publish_model_service", {"public_name": "qwen", "deployment_ids": [dep]})
+    assert not is_error and payload["warnings"]
+    assert ctx.ledger.get(payload["service_id"]).lens_execution_id == "msg-1"
