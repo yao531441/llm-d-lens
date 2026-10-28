@@ -1,4 +1,4 @@
-"""plan_deployment pipeline: cluster session -> guide plan -> render. Pure computation, no cluster changes."""
+"""Plan pipeline: cluster session -> guide plan -> render. Pure computation, no cluster changes."""
 
 from __future__ import annotations
 
@@ -10,7 +10,9 @@ import yaml
 
 from .cluster_info import cluster_summary
 from .context import ToolContext
+from .deploy_spec import DeploymentSpec, EngineSpec, PlanParams, RoleSpec, Topology, gpus_total, plan_params, role_gpus
 from .errors import ToolError
+from .ledger import PLAN_TTL_SECONDS
 
 _POD_TEMPLATE_PATHS = (("spec", "template"), ("spec", "leaderWorkerTemplate", "workerTemplate"))
 
@@ -148,18 +150,43 @@ def candidate_config(args, *, cluster: dict[str, Any], server: str, variant: str
     }
 
 
-async def build_plan(ctx: ToolContext, args) -> dict[str, Any]:
-    summary = await cluster_summary(ctx, args.cluster_id)
-    accelerator = pick_accelerator(args.accelerator, summary)
-    session = await ctx.api.request("GET", "/cluster/session", params={"clusterId": args.cluster_id})
+def resolved_spec(
+    spec: DeploymentSpec, params: PlanParams, *, accelerator: str, server: str, variant: str, image: str, name: str
+) -> DeploymentSpec:
+    """The spec with every default made explicit, so the agent sees exactly what will be created."""
+    decode = RoleSpec(replicas=params.replicas, tensor_parallel_size=params.tensor_parallel_size)
+    if params.guide == "pd-disaggregation":
+        prefill = RoleSpec(replicas=params.prefill_replicas, tensor_parallel_size=params.prefill_tensor_parallel_size)
+        topology = Topology(prefill=prefill, decode=decode)
+    else:
+        topology = Topology(serving=decode)
+    return spec.model_copy(
+        update={
+            "accelerator": accelerator,
+            "engine_kind": server,
+            "variant": variant,
+            "runtime_image": image,
+            "name": name,
+            "topology": topology,
+            "engine": EngineSpec(max_model_len=params.max_model_len),
+        }
+    )
+
+
+async def build_plan(ctx: ToolContext, spec: DeploymentSpec) -> dict[str, Any]:
+    """Validate and render ``spec``, store the result as a plan and describe it. Raises ToolError when invalid."""
+    params = plan_params(spec)
+    summary = await cluster_summary(ctx, params.cluster_id)
+    accelerator = pick_accelerator(params.accelerator, summary)
+    session = await ctx.api.request("GET", "/cluster/session", params={"clusterId": params.cluster_id})
     session_id, cluster = session["sessionId"], session["cluster"]
-    catalog = await ctx.api.request("GET", "/guide-planning/catalog", params={"clusterId": args.cluster_id})
-    server, variant = resolve_guide(catalog, args.guide, accelerator, args.model_server, args.variant)
+    catalog = await ctx.api.request("GET", "/guide-planning/catalog", params={"clusterId": params.cluster_id})
+    server, variant = resolve_guide(catalog, params.guide, accelerator, params.model_server, params.variant)
 
     plan = await ctx.api.request(
         "POST",
         "/guide-planning/plan",
-        body=planning_request(args, accelerator=accelerator, server=server, variant=variant, session_id=session_id),
+        body=planning_request(params, accelerator=accelerator, server=server, variant=variant, session_id=session_id),
         timeout=240,
     )
     validation = plan.get("validation") or {}
@@ -182,24 +209,24 @@ async def build_plan(ctx: ToolContext, args) -> dict[str, Any]:
         )
 
     workloads = (plan.get("deployment") or {}).get("readinessDeployments") or []
-    image = args.image or serving_image(manifest, workloads)
+    image = params.image or serving_image(manifest, workloads)
     if not image:
         raise ToolError(
             "image_unresolved",
             "Could not determine the model-server image from the guide manifest.",
-            field="image",
-            hint="Pass image explicitly.",
+            field="spec.runtime_image",
+            hint="Pass spec.runtime_image explicitly.",
         )
 
-    name = args.name or f"mcp-{slug(args.model.rsplit('/', 1)[-1], 30)}-{uuid.uuid4().hex[:4]}"
+    name = params.name or f"mcp-{slug(params.model.rsplit('/', 1)[-1], 30)}-{uuid.uuid4().hex[:4]}"
     rendered = await ctx.api.request(
         "POST",
         "/configurations/render",
         body={
-            "candidate_config": candidate_config(args, cluster=cluster, server=server, variant=variant, image=image),
+            "candidate_config": candidate_config(params, cluster=cluster, server=server, variant=variant, image=image),
             "render": {
                 "format": "manifest",
-                "guide_ref": args.guide,
+                "guide_ref": params.guide,
                 "template_ref": plan["source"]["files"][0],
                 "guide_source": plan["source"],
                 "rendered_manifest": manifest,
@@ -217,34 +244,40 @@ async def build_plan(ctx: ToolContext, args) -> dict[str, Any]:
         },
     )
 
-    plan_summary = plan.get("summary") or {}
-    description = {
-        "guide": args.guide,
-        "accelerator": accelerator,
-        "model_server": server,
-        "variant": variant,
-        "model": args.model,
-        "deployment_name": name,
-        "image": image,
-        "replicas": args.replicas,
-        "tensor_parallel_size": args.tensor_parallel_size,
-        "accelerators_per_replica": plan_summary.get("acceleratorsPerReplica"),
-        "accelerators_free": plan_summary.get("availableAccelerators"),
-        "validation": {"status": validation.get("status"), "warnings": validation.get("warnings") or []},
-    }
+    warnings = [{"code": "guide_warning", "message": text} for text in validation.get("warnings") or []]
+    total, free = gpus_total(params), summary.get("accelerators_free")
+    resolved = resolved_spec(
+        spec, params, accelerator=accelerator, server=server, variant=variant, image=image, name=name
+    )
+    if free is not None and total > free:
+        warnings.append(
+            {
+                "code": "insufficient_capacity",
+                "message": f"The plan needs {total} accelerators but only {free} are free now; it may stay pending.",
+            }
+        )
     plan_id = ctx.ledger.put_plan(
         owner=ctx.owner,
-        cluster_id=args.cluster_id,
+        cluster_id=params.cluster_id,
         payload={
             "cluster_id": cluster["id"],
             "cluster_session_id": session_id,
             "deployable_configuration": rendered["deployable_configuration"],
-            "description": description,
+            "name": name,
+            "spec": resolved.model_dump(exclude_none=True),
         },
     )
     return {
         "plan_id": plan_id,
-        **description,
-        "expires_in_seconds": 3600,
-        "next": "Call create_deployment with this plan_id.",
+        "status": "valid_with_warnings" if warnings else "valid",
+        "expires_in_seconds": PLAN_TTL_SECONDS,
+        "resolved_spec": resolved.model_dump(exclude_none=True),
+        "resources": {
+            "gpus_total": total,
+            "by_role": role_gpus(params),
+            "accelerators_free": free,
+            "fits_now": None if free is None else total <= free,
+        },
+        "validation": {"errors": [], "warnings": warnings},
+        "next": "Call create_deployment(plan_id=...) to start it.",
     }

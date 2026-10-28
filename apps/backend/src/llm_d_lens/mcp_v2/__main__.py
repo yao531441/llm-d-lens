@@ -12,7 +12,7 @@ import os
 
 from mcp.server.stdio import stdio_server
 
-from .context import ToolContext
+from .context import ToolContext, scopes_from_env
 from .ledger import Ledger, default_ledger_path
 from .lens_api import HttpLensApi
 from .server import build_server
@@ -23,7 +23,7 @@ async def main() -> None:
     ledger = Ledger(default_ledger_path())
 
     async def context() -> ToolContext:
-        return ToolContext(api=api, ledger=ledger, owner=await api.principal_id())
+        return ToolContext(api=api, ledger=ledger, owner=await api.principal_id(), scopes=scopes_from_env())
 
     server = build_server(context)
     async with stdio_server() as (read, write):

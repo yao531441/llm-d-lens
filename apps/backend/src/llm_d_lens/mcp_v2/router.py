@@ -6,7 +6,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
-from .context import ToolContext
+from .context import ToolContext, scopes_from_env
 from .ledger import Ledger, default_ledger_path
 from .lens_api import AsgiLensApi
 from .server import build_server
@@ -31,7 +31,7 @@ class McpV2Response(Response):
     async def __call__(self, scope, receive, send):
         async def context() -> ToolContext:
             api = AsgiLensApi(self.request)
-            return ToolContext(api=api, ledger=get_ledger(), owner=await api.principal_id())
+            return ToolContext(api=api, ledger=get_ledger(), owner=await api.principal_id(), scopes=scopes_from_env())
 
         manager = StreamableHTTPSessionManager(build_server(context), stateless=True)
         async with manager.run():

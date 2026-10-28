@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -11,6 +12,10 @@ from pydantic import BaseModel, ValidationError
 from .context import ToolContext
 from .errors import ToolError
 from .lens_api import LensApiError
+from .safety import find_secret, redact
+
+PROFILES = ("core", "serving", "storage", "simulation", "cluster-admin", "lens-settings")
+DESTRUCTIVE_PER_HOUR = int(os.environ.get("LENS_MCP_V2_DESTRUCTIVE_PER_HOUR", "100"))
 
 Handler = Callable[[ToolContext, Any], Awaitable[dict[str, Any]]]
 
@@ -25,6 +30,7 @@ class ToolSpec:
     destructive: bool = False
     idempotent: bool = False
     open_world: bool = False
+    profile: str = "core"
 
     def input_schema(self) -> dict[str, Any]:
         schema = self.input_model.model_json_schema()
@@ -46,6 +52,7 @@ def tool(
     destructive: bool = False,
     idempotent: bool = False,
     open_world: bool = False,
+    profile: str = "core",
 ):
     """Register a handler. Annotations describe real behaviour so the host can apply its own approval policy."""
 
@@ -53,17 +60,25 @@ def tool(
         if name in _TOOLS:
             raise ValueError(f"duplicate tool {name}")
         _TOOLS[name] = ToolSpec(
-            name, description, input_model, handler, read_only, destructive, idempotent or read_only, open_world
+            name,
+            description,
+            input_model,
+            handler,
+            read_only,
+            destructive,
+            idempotent or read_only,
+            open_world,
+            profile,
         )
         return handler
 
     return register
 
 
-def all_tools() -> list[ToolSpec]:
+def all_tools(scopes: frozenset[str] | set[str] | None = None) -> list[ToolSpec]:
     from . import tools  # noqa: F401  (importing registers every tool)
 
-    return list(_TOOLS.values())
+    return [spec for spec in _TOOLS.values() if scopes is None or spec.profile in scopes]
 
 
 def _validation_error(error: ValidationError) -> ToolError:
@@ -94,17 +109,63 @@ def upstream_error(error: LensApiError) -> ToolError:
 
 async def call_tool(ctx: ToolContext, name: str, arguments: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     """Run a tool and return ``(payload, is_error)``; never raises for expected failures."""
+    payload, is_error = await _dispatch(ctx, name, arguments)
+    return redact(payload), is_error
+
+
+async def _dispatch(ctx: ToolContext, name: str, arguments: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     spec = next((item for item in all_tools() if item.name == name), None)
     if spec is None:
         return ToolError(
             "unknown_tool", f"No tool named {name}", hint="List tools and pick an existing name."
         ).payload(), True
+    if spec.profile not in ctx.scopes:
+        return ToolError(
+            "scope_required",
+            f"{name} belongs to the '{spec.profile}' profile, which this connection does not have.",
+            hint="This connection cannot perform the operation. Ask the user to start the server with that profile "
+            "(LENS_MCP_V2_PROFILES) if it is really needed.",
+        ).payload(), True
+    replay_key = None
     try:
         args = spec.input_model.model_validate(arguments or {})
-        return await spec.handler(ctx, args), False
+        secret = find_secret(arguments or {})
+        if secret:
+            raise ToolError(
+                "secret_in_argument",
+                f"{secret} looks like an access token or secret.",
+                field=secret.split(" ")[0],
+                hint="Lens does not accept plaintext secrets. Use the credentials already configured in the cluster.",
+            )
+        if not spec.read_only:
+            replay_key = getattr(args, "client_request_id", None)
+            if replay_key:
+                cached = ctx.ledger.get_idempotent(ctx.owner, name, replay_key)
+                if cached is not None:
+                    return {**cached, "meta": {"idempotent_replay": True}}, False
+            if spec.destructive and ctx.ledger.count_actions(ctx.owner, "destructive") >= DESTRUCTIVE_PER_HOUR:
+                raise ToolError(
+                    "rate_limited",
+                    f"{DESTRUCTIVE_PER_HOUR} destructive operations were already performed in the last hour.",
+                    hint="Wait, or ask the user to do bulk cleanup in the Lens UI.",
+                )
+            if spec.destructive:
+                ctx.ledger.record_action(ctx.owner, "destructive")
+        result = await spec.handler(ctx, args)
+        if replay_key:
+            ctx.ledger.put_idempotent(ctx.owner, name, replay_key, result)
+        _audit(ctx, spec, arguments, False, None)
+        return result, False
     except ValidationError as error:
-        return _validation_error(error).payload(), True
+        failure = _validation_error(error)
     except ToolError as error:
-        return error.payload(), True
+        failure = error
     except LensApiError as error:
-        return upstream_error(error).payload(), True
+        failure = upstream_error(error)
+    _audit(ctx, spec, arguments, True, failure.message)
+    return failure.payload(), True
+
+
+def _audit(ctx: ToolContext, spec: ToolSpec, arguments: dict[str, Any], is_error: bool, summary: str | None) -> None:
+    if not spec.read_only:
+        ctx.ledger.audit(ctx.owner, spec.name, redact(arguments or {}), is_error, summary)

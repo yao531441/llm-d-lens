@@ -29,8 +29,8 @@ async def test_streamable_http_lists_tools_with_annotations_and_returns_structur
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         listed = await rpc(client, "tools/list")
         tools = {tool["name"]: tool for tool in listed["tools"]}
-        assert {"plan_deployment", "create_deployment", "delete_deployment"} <= set(tools)
-        assert tools["delete_deployment"]["annotations"]["destructiveHint"] is True
+        assert {"plan_deployment", "create_deployment", "delete_resources"} <= set(tools)
+        assert tools["delete_resources"]["annotations"]["destructiveHint"] is True
         assert tools["get_deployment"]["annotations"]["readOnlyHint"] is True
 
         called = await rpc(client, "tools/call", {"name": "create_deployment", "arguments": {}})

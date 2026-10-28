@@ -18,6 +18,17 @@ from pathlib import Path
 from typing import Any
 
 PLAN_TTL_SECONDS = 3600
+IDEMPOTENCY_TTL_SECONDS = 24 * 3600
+
+# Agent-facing id prefixes per resource kind (``dep-1a2b3c4d``).
+KIND_PREFIXES = {
+    "deployment": "dep",
+    "experiment": "exp",
+    "model_cache": "mc",
+    "storage_volume": "vol",
+    "model_service": "svc",
+    "simulation": "sim",
+}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS resources (
@@ -37,6 +48,24 @@ CREATE TABLE IF NOT EXISTS resources (
 CREATE INDEX IF NOT EXISTS resources_owner ON resources (owner, kind, state);
 CREATE INDEX IF NOT EXISTS resources_execution ON resources (lens_execution_id);
 CREATE INDEX IF NOT EXISTS resources_root ON resources (root_id);
+CREATE TABLE IF NOT EXISTS idempotency (
+    owner TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    key TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    payload TEXT NOT NULL,
+    PRIMARY KEY (owner, tool, key)
+);
+CREATE TABLE IF NOT EXISTS actions (owner TEXT NOT NULL, bucket TEXT NOT NULL, ts REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS actions_lookup ON actions (owner, bucket, ts);
+CREATE TABLE IF NOT EXISTS audit (
+    ts REAL NOT NULL,
+    owner TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    arguments TEXT NOT NULL,
+    is_error INTEGER NOT NULL,
+    summary TEXT
+);
 CREATE TABLE IF NOT EXISTS plans (
     plan_id TEXT PRIMARY KEY,
     owner TEXT NOT NULL,
@@ -108,7 +137,9 @@ class Ledger:
         meta: dict[str, Any] | None = None,
         state: str = "active",
     ) -> Resource:
-        resource_id = f"{kind[:3]}-{uuid.uuid4().hex[:8]}"
+        if kind not in KIND_PREFIXES:
+            raise ValueError(f"unknown resource kind {kind}")
+        resource_id = f"{KIND_PREFIXES[kind]}-{uuid.uuid4().hex[:8]}"
         self._write(
             "INSERT INTO resources (id, kind, owner, cluster_id, lens_run_id, lens_execution_id, root_id, name,"
             " state, created_at, meta) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -185,3 +216,47 @@ class Ledger:
 
     def drop_plan(self, plan_id: str) -> None:
         self._write("DELETE FROM plans WHERE plan_id = ?", (plan_id,))
+
+    def update_meta(self, resource_id: str, patch: dict[str, Any]) -> None:
+        row = self.get(resource_id)
+        if row is not None:
+            self._write("UPDATE resources SET meta = ? WHERE id = ?", (json.dumps({**row.meta, **patch}), resource_id))
+
+    def set_name(self, resource_id: str, name: str) -> None:
+        self._write("UPDATE resources SET name = ? WHERE id = ?", (name, resource_id))
+
+    def bind_root(self, resource_id: str, root_id: str) -> None:
+        self._write("UPDATE resources SET root_id = ? WHERE id = ?", (root_id, resource_id))
+
+    def get_idempotent(self, owner: str, tool: str, key: str) -> dict[str, Any] | None:
+        rows = self._read(
+            "SELECT payload FROM idempotency WHERE owner = ? AND tool = ? AND key = ? AND created_at >= ?",
+            (owner, tool, key, time.time() - IDEMPOTENCY_TTL_SECONDS),
+        )
+        return json.loads(rows[0]["payload"]) if rows else None
+
+    def put_idempotent(self, owner: str, tool: str, key: str, payload: dict[str, Any]) -> None:
+        self._write(
+            "INSERT OR REPLACE INTO idempotency (owner, tool, key, created_at, payload) VALUES (?,?,?,?,?)",
+            (owner, tool, key, time.time(), json.dumps(payload)),
+        )
+
+    def record_action(self, owner: str, bucket: str, count: int = 1) -> None:
+        now = time.time()
+        with self._lock, self._db:
+            self._db.executemany(
+                "INSERT INTO actions (owner, bucket, ts) VALUES (?,?,?)", [(owner, bucket, now)] * count
+            )
+
+    def count_actions(self, owner: str, bucket: str, window_seconds: float = 3600) -> int:
+        rows = self._read(
+            "SELECT COUNT(*) AS n FROM actions WHERE owner = ? AND bucket = ? AND ts >= ?",
+            (owner, bucket, time.time() - window_seconds),
+        )
+        return int(rows[0]["n"])
+
+    def audit(self, owner: str, tool: str, arguments: dict[str, Any], is_error: bool, summary: str | None) -> None:
+        self._write(
+            "INSERT INTO audit (ts, owner, tool, arguments, is_error, summary) VALUES (?,?,?,?,?,?)",
+            (time.time(), owner, tool, json.dumps(arguments, default=str)[:4000], int(is_error), (summary or "")[:500]),
+        )

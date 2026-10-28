@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable
 from mcp.server.lowlevel import Server
 from mcp.types import CallToolResult, TextContent, Tool, ToolAnnotations
 
-from .context import ToolContext
+from .context import ToolContext, scopes_from_env
 from .lens_api import LensApiError
 from .registry import all_tools, call_tool, upstream_error
 
@@ -34,7 +34,7 @@ def build_server(context: ContextFactory) -> Server:
                     openWorldHint=spec.open_world,
                 ),
             )
-            for spec in all_tools()
+            for spec in all_tools(scopes_from_env())
         ]
 
     @server.call_tool(validate_input=False)
