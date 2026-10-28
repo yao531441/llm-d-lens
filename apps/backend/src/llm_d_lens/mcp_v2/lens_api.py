@@ -80,7 +80,7 @@ class AsgiLensApi:
     async def principal_id(self) -> str:
         principal = getattr(self._request.state, "principal", None)
         if principal is None:
-            raise LensApiError(401, "no authenticated principal", "-", "-")
+            raise LensApiError(401, "Lens request is not authenticated.", "GET", "/auth/session")
         return principal.user_id
 
     def _headers(self, method: str, path: str) -> dict[str, str]:

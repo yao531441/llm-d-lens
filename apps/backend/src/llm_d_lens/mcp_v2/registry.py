@@ -77,7 +77,7 @@ def _validation_error(error: ValidationError) -> ToolError:
     )
 
 
-def _upstream_error(error: LensApiError) -> ToolError:
+def upstream_error(error: LensApiError) -> ToolError:
     hints = {
         401: "Lens rejected the credentials; the session may have expired.",
         403: "The Lens user lacks permission for this operation.",
@@ -107,4 +107,4 @@ async def call_tool(ctx: ToolContext, name: str, arguments: dict[str, Any]) -> t
     except ToolError as error:
         return error.payload(), True
     except LensApiError as error:
-        return _upstream_error(error).payload(), True
+        return upstream_error(error).payload(), True

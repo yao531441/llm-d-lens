@@ -9,7 +9,8 @@ from mcp.server.lowlevel import Server
 from mcp.types import CallToolResult, TextContent, Tool, ToolAnnotations
 
 from .context import ToolContext
-from .registry import all_tools, call_tool
+from .lens_api import LensApiError
+from .registry import all_tools, call_tool, upstream_error
 
 ContextFactory = Callable[[], Awaitable[ToolContext]]
 
@@ -38,7 +39,12 @@ def build_server(context: ContextFactory) -> Server:
 
     @server.call_tool(validate_input=False)
     async def handle(name, arguments):
-        payload, is_error = await call_tool(await context(), name, arguments or {})
+        try:
+            ctx = await context()
+        except LensApiError as error:
+            payload, is_error = upstream_error(error).payload(), True
+        else:
+            payload, is_error = await call_tool(ctx, name, arguments or {})
         return CallToolResult(content=[TextContent(type="text", text=json.dumps(payload, indent=2))], isError=is_error)
 
     return server
