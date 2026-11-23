@@ -27,6 +27,8 @@ class RoutePermission:
     method: str
     path: str
     permission: str | tuple[str, ...] | None
+    #: Manages credentials: only a login session may call it, never a token, an internal call or an assistant.
+    session_only: bool = False
 
 
 def _regex_for(path_template: str) -> re.Pattern[str]:
@@ -61,18 +63,21 @@ ROUTE_PERMISSIONS: tuple[RoutePermission, ...] = (
     # --- auth session ---
     RoutePermission("POST", "/api/v1/auth/logout", AUTHENTICATED),
     RoutePermission("GET", "/api/v1/auth/session", AUTHENTICATED),
-    RoutePermission("POST", "/api/v1/auth/password", AUTHENTICATED),
-    RoutePermission("GET", "/api/v1/auth/sessions", AUTHENTICATED),
+    RoutePermission("POST", "/api/v1/auth/password", AUTHENTICATED, session_only=True),
+    RoutePermission("GET", "/api/v1/auth/sessions", AUTHENTICATED, session_only=True),
+    RoutePermission("GET", "/api/v1/auth/access-tokens", AUTHENTICATED, session_only=True),
+    RoutePermission("POST", "/api/v1/auth/access-tokens", AUTHENTICATED, session_only=True),
+    RoutePermission("DELETE", "/api/v1/auth/access-tokens/{token_id}", AUTHENTICATED, session_only=True),
     RoutePermission("GET", "/api/v1/auth/permissions", "role:role:read"),
-    RoutePermission("GET", "/api/v1/sessions", AUTHENTICATED),
-    RoutePermission("DELETE", "/api/v1/sessions/{session_id}", AUTHENTICATED),
+    RoutePermission("GET", "/api/v1/sessions", AUTHENTICATED, session_only=True),
+    RoutePermission("DELETE", "/api/v1/sessions/{session_id}", AUTHENTICATED, session_only=True),
     # --- users ---
     RoutePermission("GET", "/api/v1/users", "user:user:read"),
-    RoutePermission("POST", "/api/v1/users", "user:user:create"),
+    RoutePermission("POST", "/api/v1/users", "user:user:create", session_only=True),
     RoutePermission("GET", "/api/v1/users/{user_id}", "user:user:read"),
     RoutePermission("PATCH", "/api/v1/users/{user_id}", "user:user:update"),
     RoutePermission("DELETE", "/api/v1/users/{user_id}", "user:user:delete"),
-    RoutePermission("POST", "/api/v1/users/{user_id}/password", "user:user:reset-password"),
+    RoutePermission("POST", "/api/v1/users/{user_id}/password", "user:user:reset-password", session_only=True),
     RoutePermission("GET", "/api/v1/users/{user_id}/groups", "group:group:manage-members"),
     RoutePermission("PUT", "/api/v1/users/{user_id}/groups", "group:group:manage-members"),
     RoutePermission("GET", "/api/v1/users/{user_id}/role-bindings", "role:binding:manage"),
@@ -97,13 +102,15 @@ ROUTE_PERMISSIONS: tuple[RoutePermission, ...] = (
     RoutePermission("DELETE", "/api/v1/roles/{role_id}", "role:role:delete"),
     RoutePermission("PUT", "/api/v1/roles/{role_id}/permissions", "role:role:update"),
     # --- identity providers ---
-    RoutePermission("GET", "/api/v1/identity-providers", "idp:provider:read"),
-    RoutePermission("POST", "/api/v1/identity-providers", "idp:provider:configure"),
-    RoutePermission("GET", "/api/v1/identity-providers/{provider_id}", "idp:provider:read"),
-    RoutePermission("PATCH", "/api/v1/identity-providers/{provider_id}", "idp:provider:configure"),
-    RoutePermission("DELETE", "/api/v1/identity-providers/{provider_id}", "idp:provider:configure"),
-    RoutePermission("POST", "/api/v1/identity-providers/{provider_id}/test", "idp:provider:configure"),
-    RoutePermission("POST", "/api/v1/identity-providers/{provider_id}/sync", "idp:sync:execute"),
+    RoutePermission("GET", "/api/v1/identity-providers", "idp:provider:read", session_only=True),
+    RoutePermission("POST", "/api/v1/identity-providers", "idp:provider:configure", session_only=True),
+    RoutePermission("GET", "/api/v1/identity-providers/{provider_id}", "idp:provider:read", session_only=True),
+    RoutePermission("PATCH", "/api/v1/identity-providers/{provider_id}", "idp:provider:configure", session_only=True),
+    RoutePermission("DELETE", "/api/v1/identity-providers/{provider_id}", "idp:provider:configure", session_only=True),
+    RoutePermission(
+        "POST", "/api/v1/identity-providers/{provider_id}/test", "idp:provider:configure", session_only=True
+    ),
+    RoutePermission("POST", "/api/v1/identity-providers/{provider_id}/sync", "idp:sync:execute", session_only=True),
     # --- audit ---
     RoutePermission("GET", "/api/v1/audit-logs", "audit:log:read"),
     # --- access management ---
@@ -134,8 +141,12 @@ ROUTE_PERMISSIONS: tuple[RoutePermission, ...] = (
     RoutePermission("POST", "/api/cluster/clusters", "cluster:cluster:create"),
     RoutePermission("DELETE", "/api/cluster/clusters/{cluster_id}", "cluster:cluster:delete"),
     RoutePermission("PATCH", "/api/cluster/clusters/{cluster_id}", "cluster:cluster:update"),
-    RoutePermission("POST", "/api/cluster/clusters/{cluster_id}/hf-token-secrets", "cluster:hf-token:create"),
-    RoutePermission("PUT", "/api/cluster/clusters/{cluster_id}/hf-token-secret", "cluster:hf-token:update"),
+    RoutePermission(
+        "POST", "/api/cluster/clusters/{cluster_id}/hf-token-secrets", "cluster:hf-token:create", session_only=True
+    ),
+    RoutePermission(
+        "PUT", "/api/cluster/clusters/{cluster_id}/hf-token-secret", "cluster:hf-token:update", session_only=True
+    ),
     RoutePermission("POST", "/api/cluster/clusters/{cluster_id}/nodes/cordon", "cluster:node:operate"),
     RoutePermission("POST", "/api/cluster/clusters/{cluster_id}/nodes/uncordon", "cluster:node:operate"),
     RoutePermission("GET", "/api/cluster/clusters/{cluster_id}/software-downloads", "cluster:cluster:read"),
@@ -183,11 +194,11 @@ ROUTE_PERMISSIONS: tuple[RoutePermission, ...] = (
     RoutePermission("GET", "/api/simulation/trace-datasets/{dataset_name}/timeline", "simulation:task:read"),
     # --- AI providers ---
     RoutePermission("GET", "/api/v1/ai-providers", "ai-provider:provider:read"),
-    RoutePermission("POST", "/api/v1/ai-providers", "ai-provider:provider:create"),
+    RoutePermission("POST", "/api/v1/ai-providers", "ai-provider:provider:create", session_only=True),
     RoutePermission("POST", "/api/v1/ai-providers/test", "ai-provider:provider:test"),
-    RoutePermission("DELETE", "/api/v1/ai-providers/{provider_id}", "ai-provider:provider:delete"),
+    RoutePermission("DELETE", "/api/v1/ai-providers/{provider_id}", "ai-provider:provider:delete", session_only=True),
     RoutePermission("GET", "/api/v1/ai-providers/{provider_id}", "ai-provider:provider:read"),
-    RoutePermission("PUT", "/api/v1/ai-providers/{provider_id}", "ai-provider:provider:update"),
+    RoutePermission("PUT", "/api/v1/ai-providers/{provider_id}", "ai-provider:provider:update", session_only=True),
     RoutePermission("POST", "/api/v1/ai-providers/{provider_id}/chat/completions", "ai-provider:provider:chat"),
     RoutePermission("POST", "/api/v1/ai-providers/{provider_id}/test", "ai-provider:provider:test"),
     # --- AIC / candidate ---
@@ -338,16 +349,18 @@ ROUTE_PERMISSIONS: tuple[RoutePermission, ...] = (
     # --- system ---
     RoutePermission("GET", "/api/v1/system/database", "system:database:read"),
     RoutePermission("POST", "/api/v1/system/database", "system:database:configure"),
-    RoutePermission("GET", "/api/v1/system/secret-key", "system:secret:read"),
-    RoutePermission("POST", "/api/v1/system/secret-key/rotate", "system:secret:manage"),
-    RoutePermission("DELETE", "/api/v1/system/secret-key/old", "system:secret:manage"),
+    RoutePermission("GET", "/api/v1/system/secret-key", "system:secret:read", session_only=True),
+    RoutePermission("POST", "/api/v1/system/secret-key/rotate", "system:secret:manage", session_only=True),
+    RoutePermission("DELETE", "/api/v1/system/secret-key/old", "system:secret:manage", session_only=True),
     # --- versions ---
     RoutePermission("GET", "/api/v1/versions", AUTHENTICATED),
     # --- model service: user ---
-    RoutePermission("GET", "/api/v1/model-service/tokens", "model-service:token:manage"),
-    RoutePermission("POST", "/api/v1/model-service/tokens", "model-service:token:manage"),
-    RoutePermission("POST", "/api/v1/model-service/tokens/regenerate", "model-service:token:manage"),
-    RoutePermission("DELETE", "/api/v1/model-service/tokens/{token_id}", "model-service:token:manage"),
+    RoutePermission("GET", "/api/v1/model-service/tokens", "model-service:token:manage", session_only=True),
+    RoutePermission("POST", "/api/v1/model-service/tokens", "model-service:token:manage", session_only=True),
+    RoutePermission("POST", "/api/v1/model-service/tokens/regenerate", "model-service:token:manage", session_only=True),
+    RoutePermission(
+        "DELETE", "/api/v1/model-service/tokens/{token_id}", "model-service:token:manage", session_only=True
+    ),
     RoutePermission("GET", "/api/v1/model-service/models", "model-service:inference:use"),
     RoutePermission("GET", "/api/v1/model-service/connection", "model-service:inference:use"),
     RoutePermission("GET", "/api/v1/model-service/usage/records", "model-service:usage:read"),
@@ -407,6 +420,9 @@ ROUTE_PERMISSIONS: tuple[RoutePermission, ...] = (
 _COMPILED: tuple[tuple[str, re.Pattern[str], str | tuple[str, ...] | None], ...] = tuple(
     (entry.method, _regex_for(entry.path), entry.permission) for entry in ROUTE_PERMISSIONS
 )
+_SESSION_ONLY: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (entry.method, _regex_for(entry.path)) for entry in ROUTE_PERMISSIONS if entry.session_only
+)
 
 
 def resolve_route_permission(method: str, path: str) -> tuple[bool, str | tuple[str, ...] | None]:
@@ -416,6 +432,12 @@ def resolve_route_permission(method: str, path: str) -> tuple[bool, str | tuple[
         if entry_method == upper and pattern.match(path):
             return True, permission
     return False, None
+
+
+def route_requires_login_session(method: str, path: str) -> bool:
+    """Whether a registered route manages credentials and so accepts only a login session."""
+    upper = method.upper()
+    return any(entry_method == upper and pattern.match(path) for entry_method, pattern in _SESSION_ONLY)
 
 
 #: Routes that are not part of the OpenAPI schema but are still served.

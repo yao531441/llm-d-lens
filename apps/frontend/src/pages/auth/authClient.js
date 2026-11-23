@@ -21,3 +21,15 @@ export function logout() {
 export function changePassword(oldPassword, newPassword) {
     return postJson('/api/v1/auth/password', { oldPassword, newPassword });
 }
+
+export function fetchAccessTokens() {
+    return requestJson('/api/v1/auth/access-tokens');
+}
+
+export function createAccessToken(name, expiresInDays) {
+    return postJson('/api/v1/auth/access-tokens', { name, expiresInDays });
+}
+
+export function revokeAccessToken(id) {
+    return requestJson(`/api/v1/auth/access-tokens/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}

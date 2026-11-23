@@ -12,6 +12,19 @@ role name, determines this landing page. If no pages are accessible, Lens shows
 an access-denied message. Refreshing an existing signed-in session preserves a
 valid page URL and its filters; a fresh sign-in starts at the landing page instead.
 
+## Personal access tokens
+
+Open **Account → Personal access tokens** in the sidebar. Enter a name and a lifetime
+of 1–365 days (default 30), then click **Create token**. Copy the plaintext immediately;
+it is displayed only once and is discarded when the dialog closes. Hide it before
+creating another token. The list shows status, expiry and last use; **Revoke** invalidates
+one token immediately. Load errors offer a retry without clearing the current list.
+
+Tokens use your current Lens permissions and resource scope. They are separate from
+browser sessions and model inference keys. Password changes/resets and disabling your
+account invalidate them; new login sessions do not. Token and other credential management
+requires a normal login session. See [MCP integration](/mcp) for Bearer and stdio setup.
+
 ## Switch color mode
 
 Use the sun/moon button at the right of the top bar to switch between dark

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import contextvars
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -17,7 +17,7 @@ from starlette.requests import Request
 from llm_d_lens.auth.contracts import Principal, RoleBinding, ScopeType
 from llm_d_lens.auth.permissions import ALL_PERMISSIONS
 from llm_d_lens.auth.policy import authorize
-from llm_d_lens.auth.routes import resolve_route_permission
+from llm_d_lens.auth.routes import resolve_route_permission, route_requires_login_session
 from llm_d_lens.auth.security import verify_internal
 from llm_d_lens.auth.service import default_service
 from llm_d_lens.auth.settings import get_settings
@@ -137,7 +137,7 @@ def token_from_request(request: Request) -> str | None:
     """Extract the opaque session token from the cookie or Bearer header."""
     cookie = request.cookies.get(SESSION_COOKIE)
     if cookie:
-        return cookie
+        return None if cookie.startswith("lens-pat-") else cookie
     header = request.headers.get("authorization", "")
     if header.lower().startswith("bearer "):
         return header[7:].strip() or None
@@ -180,7 +180,7 @@ def _internal_principal(request: Request) -> Principal | None:
     user = default_service().user_dao.get(principal_id)
     if user is None or user.status != "active":
         return None
-    return default_service().principal_for(user)
+    return replace(default_service().principal_for(user), credential_type="internal")
 
 
 class AuthContextMiddleware(BaseHTTPMiddleware):
@@ -191,11 +191,10 @@ class AuthContextMiddleware(BaseHTTPMiddleware):
         if get_settings().disabled:
             principal = _disabled_principal()
         else:
-            principal = _internal_principal(request)
-            if principal is None:
-                token = token_from_request(request)
-                if token:
-                    principal = default_service().validate(token)
+            token = token_from_request(request)
+            # Forwarded credentials remain authoritative even when an internal
+            # adapter also signs the request. Never upgrade a PAT to a session.
+            principal = default_service().validate(token) if token else _internal_principal(request)
         request.state.principal = principal
         request.state.principal_token = token_from_request(request)
         found, permission = resolve_route_permission(request.method, request.url.path)
@@ -235,6 +234,12 @@ async def require_route_permission(request: Request) -> None:
     principal: Principal | None = getattr(request.state, "principal", None)
     if principal is None:
         raise UnauthenticatedError("authentication required")
+    # An assistant or agent call is never a credential-management request, even when it forwards a login session:
+    # the header can only narrow what a caller may do.
+    if (
+        principal.credential_type != "session" or request.headers.get("x-prism-source") == "assistant"
+    ) and route_requires_login_session(request.method, request.url.path):
+        raise ForbiddenError("a login session is required to manage credentials")
     if principal.must_change_password and request.url.path not in _PASSWORD_CHANGE_ALLOWED:
         raise PasswordChangeRequiredError("password change required before continuing")
     if permission == "":

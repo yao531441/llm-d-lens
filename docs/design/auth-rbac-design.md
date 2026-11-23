@@ -199,7 +199,7 @@ optional `owner_group_id` (team ownership, §7.4/§7.14).
   under the same `IdentityProvider` abstraction (see §20) and are not delivered in v1.
 - **Hard guarantees** for multi-tenant quotas and cross-cluster data isolation: v1 provides only scope-based visibility/operation rights
   (§7), and does not implement resource quotas, cross-cluster aggregation isolation, or network-level isolation.
-- Self-service issuance of API Tokens / Service Accounts for third-party developers (reserved for future work; see §16 P6).
+- Service accounts and scoped OAuth credentials remain future work; personal access tokens use the existing user identity (D29).
 - Retrospective ownership backfill for historical data with `owner_id` (only newly created objects carry owners).
 
 ---
@@ -1624,6 +1624,30 @@ Pagination/filtering reuse the existing DTO + DAO conventions; import/export is 
 
 ---
 
+### Personal access tokens (D29)
+
+Personal access tokens are independent of browser sessions and inference keys (`lens-mk-*`).
+The `personal_access_tokens` table stores `id`, `user_id` (cascading FK), `name`,
+`token_prefix`, SHA-256 `token_hash`, `created_at`, `expires_at`, `last_used_at`, and `revoked_at`.
+Only issuance returns the `lens-pat-*` plaintext, with `Cache-Control: no-store`.
+The server enforces a fixed lifetime of 1–365 days (default 30), owner-only listing/revocation,
+and resolves current roles, groups and resource scope on every authenticated request.
+Last-use updates are throttled to once per minute; authentication never extends expiry.
+
+Management requires a normal login session. PATs and credential-free signed internal
+identities cannot manage PATs, sessions, passwords, user creation, identity providers,
+stored-secret master keys, inference/Hugging Face tokens or saved external AI provider
+credentials. Built-in roles do not change. Forwarded credentials take precedence over
+an internal user assertion, preventing MCP adapters from upgrading a PAT into a session.
+PATs are accepted only in Bearer headers, never in `prism_session` cookies.
+Existing browser CSRF enforcement is unchanged.
+
+Disabling a user, changing/resetting their password, or deleting their account invalidates
+their PATs. Login/session replacement and logout do not revoke independent PATs.
+The Web Account menu owns creation/listing/revocation; external MCP uses the same REST
+identity via Bearer.
+Migration `a6c8e1f3b502` extends `e6b8d0f2a4c7`; other existing migration heads remain independent.
+
 ## 14. Migration and Compatibility
 
 1. **Data migration** (Alembic): add 11 new tables, and add the nullable columns `owner_user_id` listed in §4.2.12 to existing resource tables.
@@ -1683,7 +1707,7 @@ Pagination/filtering reuse the existing DTO + DAO conventions; import/export is 
 | **P3 Frontend** | `AuthProvider` / `LoginPage` / `permissions.js` / `PermissionGate`; `App.jsx` guard; `LeftNavigation` filtering; cluster/deployment visibility linkage; cluster selector shows only reachable clusters; `httpClient` refactor | P2 |
 | **P4 Management UI** | Users/Groups/Roles/Bindings/Sessions/Audit pages; cluster “access management”; deployment “share”; selecting owner group at creation | P3 |
 | **P5 IdP abstraction + LDAP** | `providers/` (base/local/ldap/registry) + identity-source config/test/sync + mapping UI; hybrid login | P4 |
-| **P6 Enhancements** | OIDC/SCIM providers; group hierarchy (downward inheritance only + sync flattening), API Token/Service Account, forced real-time introspection | P5 |
+| **P6 Enhancements** | OIDC/SCIM providers; group hierarchy (downward inheritance only + sync flattening), Service Account/OAuth scopes, forced real-time introspection | P5 |
 
 Each phase is independently testable and releasable; after P1+P2, a minimally usable authentication system with “default deny” is formed,
 and P3 is required before there is a usable login interface.
@@ -1797,6 +1821,7 @@ human-review requirement from the [database skill](../../.agents/skills/database
 | D26 | end-user forbidden from creating deployments | Remove `deployment:run:create` from built-in `end-user` (covering `POST /runs`, `POST /standard-vllm-runs`), and remove `deployment:agentic:create` / `approve` (approve starts a deployment); add `evaluate:workflow:create` (`POST /evaluations`, `POST /workflow-runs`) to distinguish “benchmark an existing deployment” (`evaluate:run:create` retained) from “evaluation that creates a deployment”. end-users may use only existing or explicitly shared deployments (they can still use `evaluate:run:create` to benchmark existing deployments: the wizard locks to "Use existing endpoint" and disables "Design configurations"); all other read/operate capabilities remain unchanged. **Implementation correction (§21)**: change the Casbin matcher to `keyMatch`; otherwise `keyMatch2` treats `:` in permission codes as wildcards, causing `deployment:agentic:create` and similar to unexpectedly match `deployment:run:create` |
 | D27 | Single-session policy | **Finalized (user)**: an account may have only one active session at a time—new login revokes all other sessions for that account (`PRISM_SESSION_SINGLE_ACTIVE`, default `true`) and audits with `session_revoked`; when disabled, fall back to “keep the latest `PRISM_SESSION_MAX_PER_USER`” (§5.3) |
 | D28 | Model-service inference boundary (2026-10-17) | **Approved by user:** implement Alternative A. Retire deployment sharing and `deployment:run:share`; add `model-service:group:share` for admin and cluster-scoped maintainer without changing group/Gateway management restrictions. Consumers require an inference-capable binding in the model's cluster AND a user/group model grant; operators retain non-self-scoped inference in scope. Reuse resource bindings fixed to the end-user role, limited to inference. Approve nullable model `owner_user_id` / `owner_group_id` foreign keys with SET NULL, creator backfill and initially empty historical owner groups; ownership alone grants no consumer inference or sharing. Audit and remove old deployment shares without conversion; administrators/maintainers grant model access afresh. Downgrade must not resurrect retired grants. Native HTTPRoute/EPP behavior is unchanged. |
+| D29 | Personal access tokens (approved 2026-11-12) | Independently revocable, hashed user PATs with fixed expiry and one-time plaintext display; current user RBAC applies on every request. Web login sessions manage credentials; PATs cannot mint tokens or manage credentials. MCP over Bearer HTTP shares Lens auth; no separate MCP permission or identity store. |
 
 > D1–D24 correspond to the “recommended” paths in the preceding sections and have been synced into the relevant chapters; implementation should follow them,
 > and there are no remaining blocking undecided items other than the schema approval in §18.1.
