@@ -311,3 +311,51 @@ class OverviewResponse(StrictModel):
     cluster: ClusterRecord
     fetched_at: str = Field(alias="fetchedAt")
     kubernetes: KubernetesSummary
+
+
+# --- PCIe-root topology and placement DTOs ---
+
+
+class TopologyRoot(StrictModel):
+    root: str
+    gpus: list[str]
+    nics: list[str] = Field(description="Unallocated RDMA NICs still published on this root.")
+    numa: int | None = None
+    busy_gpus: int = Field(alias="busyGpus")
+    free: bool = Field(description="Every GPU on the root is unallocated and, if required, its NIC is available.")
+
+
+class TopologyNode(StrictModel):
+    name: str
+    ready: bool
+    schedulable: bool
+    roots: list[TopologyRoot]
+    free_roots: int = Field(alias="freeRoots")
+    busy_gpus: int = Field(alias="busyGpus")
+
+
+class TopologyResponse(StrictModel):
+    profile: str
+    gpus_per_root: int = Field(alias="gpusPerRoot")
+    requires_nic: bool = Field(alias="requiresNic")
+    nodes: list[TopologyNode]
+
+
+class PlacementRole(StrictModel):
+    name: str = Field(min_length=1, max_length=64)
+    replicas: int = Field(ge=1, le=64)
+    tensor_parallel_size: int = Field(alias="tensorParallelSize", ge=1, le=64)
+
+
+class PlacementProbeRequest(StrictModel):
+    roles: list[PlacementRole] = Field(min_length=1, max_length=8)
+    role_nodes_disjoint: bool = Field(default=False, alias="roleNodesDisjoint")
+    exclude_nodes: list[str] = Field(default_factory=list, alias="excludeNodes", max_length=256)
+
+
+class PlacementProbeResponse(StrictModel):
+    fits: bool
+    assignment: dict[str, dict[str, int]] = Field(description="Role name -> node name -> pods placed there.")
+    reasons: list[str]
+    free_roots: dict[str, int] = Field(alias="freeRoots")
+    unusable_nodes: list[str] = Field(alias="unusableNodes", description="NotReady, unschedulable or excluded nodes.")

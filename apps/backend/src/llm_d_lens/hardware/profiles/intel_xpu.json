@@ -139,6 +139,12 @@
       { "pattern": "max[\\s_]*(1550|1100)", "gib": 48 }
     ]
   },
+  "placement": {
+    "root_attribute": "resource.kubernetes.io/pcieRoot",
+    "nic_driver": "dra.net",
+    "nic_rdma_attribute": "dra.net/rdma",
+    "nic_numa_attribute": "dra.net/numaNode"
+  },
   "ui": {
     "icon": "Cpu",
     "labels": { "vendor": "Intel", "metric_group": "XPU" }

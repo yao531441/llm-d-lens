@@ -34,6 +34,12 @@ snapshots. Keep Prometheus expressions in `device_metrics` consistent with these
 sources. `planning.discovery` owns the discovery command and parser settings;
 `planning.memory_models` contains hardware-specific capacity fallbacks.
 
+Add an optional `placement` block when the DRA driver publishes PCIe-root topology.
+`root_attribute` names the ResourceSlice attribute that groups devices into roots;
+`nic_driver`, `nic_rdma_attribute` and `nic_numa_attribute` describe RDMA NICs on
+each root. Lens uses it for per-root free capacity and the placement probe; hardware
+without it reports capacity totals only.
+
 Run the hardware/deploy/evaluate tests after changing a profile. A new profile must
 also pass `schema.json`; verify guide rendering against its intended llm-d revision.
 
