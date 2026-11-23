@@ -2,8 +2,10 @@
 
 from . import (  # noqa: F401
     clusters,
+    deployments,
     guides,
     models,
+    observe,
     resources,
     settings,
 )

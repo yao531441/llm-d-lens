@@ -274,3 +274,33 @@ async def test_routes_enforce_scope_before_creating_or_reading_tasks(store, monk
         "deployment:run:read",
     ]
     assert verification.list_verifications("exec-1") == []
+
+
+@pytest.mark.asyncio
+async def test_mcp_starts_native_task_and_web_reads_identical_result(store, monkeypatch):
+    from llm_d_lens.mcp.context import ToolContext
+    from llm_d_lens.mcp.lens_api import LensApiError
+    from llm_d_lens.mcp.registry import call_tool
+
+    class Api:
+        async def request(self, method, path, *, body=None, **_kwargs):
+            if path == "/deployments/runs/exec-1":
+                raise LensApiError(404, {"detail": "not found"}, method, path)
+            if path == "/deployments/executions/exec-1":
+                return {"execution_id": "exec-1", "run_id": "run-1", "case_id": "case-1", "ownership": "self"}
+            if method == "POST":
+                return await router.create_verification("exec-1", VerificationRequest(**body))
+            return await router.get_verification("exec-1", path.rsplit("/", 1)[-1])
+
+    monkeypatch.setattr(verification_checks, "http_call", AsyncMock(return_value=completion()))
+    ctx = ToolContext(api=Api(), owner="tester")
+    started, error = await call_tool(
+        ctx, "deployment_test", {"deployment_id": "exec-1", "requests": 2, "wait_seconds": 0}
+    )
+    assert not error, started
+    await verification._tasks[started["verification_id"]]
+    web = await router.get_verification("exec-1", started["verification_id"])
+    mcp, error = await call_tool(ctx, "deployment_test", {"deployment_id": "exec-1", "verification_id": web["id"]})
+    assert not error, mcp
+    assert all(mcp[key] == value for key, value in web.items())
+    assert verification_checks.http_call.await_count == 2
