@@ -747,6 +747,64 @@ Gateway 命名空间前缀会附加该 Lens 集群注册的稳定短 ID。注册
   </TabItem>
 </Tabs>
 
+### 获取集群 PCIe root 拓扑
+
+按节点把集群的 DRA 设备归到各个 PCIe root。一个张量并行组需要整 root，所以空闲容量按 root 报告：root 上所有 GPU 都未分配，且对带 RDMA 网卡的硬件，网卡仍可用。监控（admin-access）claim 被忽略。硬件 profile 没有 `placement` 块时返回 `409 topology_unsupported`。
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`GET /api/cluster/clusters/{cluster_id}/topology`**
+
+    响应字段：`profile`、`gpusPerRoot`、`requiresNic`，以及 `nodes[]`（`name`、`ready`、`schedulable`、`freeRoots`、`busyGpus`、`roots[]`）。每个 root 含 `root`、`gpus`、`nics`、`numa`、`busyGpus`、`free`。
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    from llm_d_lens.cluster import registry, service
+
+    topology = await service.get_topology(registry.require_cluster("cluster-a"))
+    print([(node["name"], node["freeRoots"]) for node in topology["nodes"]])
+    ```
+  </TabItem>
+</Tabs>
+
+### 探测整 root 放置
+
+检查 prefill、decode 这样的角色现在能否放在整块空闲的 PCIe root 上。每个副本在同一节点上占用 `tensorParallelSize / gpusPerRoot` 个空闲 root；`roleNodesDisjoint` 要求不同角色使用不同节点。结果仅供参考，因为在创建部署之前容量可能变化。
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`POST /api/cluster/clusters/{cluster_id}/placement/probe`**
+
+    ```json
+    {
+      "roles": [
+        {"name": "prefill", "replicas": 1, "tensorParallelSize": 4},
+        {"name": "decode", "replicas": 1, "tensorParallelSize": 4}
+      ],
+      "roleNodesDisjoint": true,
+      "excludeNodes": []
+    }
+    ```
+
+    响应包含 `fits`、`assignment`（角色 -> 节点 -> pod 数）、`reasons`、`freeRoots`（每节点空闲 root 数）和 `unusableNodes`（NotReady、不可调度或被排除的节点）。`fits` 为 false 时 `assignment` 为空，`reasons` 说明原因：整 root 不足、张量并行数不是每 root GPU 数的倍数，或各角色单独能放下但合起来放不下。
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    from llm_d_lens.cluster import registry, service
+
+    plan = await service.probe_placement(
+        registry.require_cluster("cluster-a"),
+        [
+            {"name": "prefill", "replicas": 1, "tensorParallelSize": 4},
+            {"name": "decode", "replicas": 1, "tensorParallelSize": 4},
+        ],
+        role_nodes_disjoint=True,
+    )
+    print(plan["fits"], plan["assignment"] or plan["reasons"])
+    ```
+  </TabItem>
+</Tabs>
+
 ### 删除集群
 
 删除由 Lens 管理的集群记录，并清理相关状态。仅当需要将集群从 Lens 中彻底移除时才应使用此操作。

@@ -30,6 +30,7 @@
     "deployment": { "$ref": "#/$defs/deployment" },
     "evaluation_profile": { "type": "string" },
     "planning": { "$ref": "#/$defs/planning" },
+    "placement": { "oneOf": [{ "$ref": "#/$defs/placement" }, { "type": "null" }] },
     "ui": { "$ref": "#/$defs/ui" }
   },
   "$defs": {
@@ -225,6 +226,17 @@
           "type": "array",
           "items": { "type": "object" }
         }
+      }
+    },
+    "placement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root_attribute"],
+      "properties": {
+        "root_attribute": { "type": "string", "minLength": 1 },
+        "nic_driver": { "type": ["string", "null"] },
+        "nic_rdma_attribute": { "type": ["string", "null"] },
+        "nic_numa_attribute": { "type": ["string", "null"] }
       }
     },
     "ui": {

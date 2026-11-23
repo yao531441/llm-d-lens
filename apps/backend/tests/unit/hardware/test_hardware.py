@@ -102,10 +102,20 @@ def test_node_memory_label_contract_round_trips():
     assert get_profile("intel-xpu").planning.node_memory == {}
 
 
+def test_placement_contribution_round_trips_and_is_optional():
+    placement = get_profile("intel-xpu").placement
+    assert placement.root_attribute == "resource.kubernetes.io/pcieRoot"
+    assert placement.nic_driver == "dra.net"
+    assert HardwareProfile.from_dict(get_profile("intel-xpu").to_dict()).placement == placement
+    assert get_profile("nvidia").placement is None
+    assert get_profile("nvidia").to_dict()["placement"] is None
+
+
 @pytest.mark.parametrize(
     "payload",
     [
         {"id": "x"},
+        _payload(placement={"nic_driver": "dra.net"}),
         _payload(request_model="cuda"),
         {**_payload(), "unknown_field": 1},
         _payload(driver={"installer": "apt"}),
