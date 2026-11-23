@@ -10,5 +10,6 @@ from . import (  # noqa: F401
     resources,
     serving,
     settings,
+    simulation,
     storage,
 )
