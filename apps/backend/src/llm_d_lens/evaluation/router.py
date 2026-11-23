@@ -43,7 +43,7 @@ from llm_d_lens.deploy.contracts import (
     RuntimeBinding,
 )
 from llm_d_lens.deploy.data_plane import deployment_uses_shared_gateway
-from llm_d_lens.deploy.usage import register_usage_probe
+from llm_d_lens.deploy.usage import exempt_usage, register_usage_probe
 from llm_d_lens.evaluation.api_models import (
     BenchmarkDefaultsResponse,
     BenchmarkRunListResponse,
@@ -2185,7 +2185,10 @@ def _deployment_cleanup_guard(execution_id: str):
         if not acquired:
             raise ValueError("Deployment still has an active benchmark; cleanup deferred")
         _ensure_benchmark_consumers_finished(execution_id)
-        yield
+        # The case that is being cleaned up is still unfinished here when it failed by exception, so
+        # the evaluate usage probe would block its own cleanup. Other consumers still apply.
+        with exempt_usage("evaluate"):
+            yield
 
 
 def _ensure_benchmark_consumers_finished(execution_id: str) -> None:

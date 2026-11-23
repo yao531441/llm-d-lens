@@ -32,7 +32,7 @@ from llm_d_lens.deploy.contracts import (
 )
 from llm_d_lens.deploy.data_plane import deployment_uses_shared_gateway
 from llm_d_lens.deploy.runtime.composition import RuntimeConfigurationError
-from llm_d_lens.deploy.usage import active_usage_reason
+from llm_d_lens.deploy.usage import DeploymentInUseError, active_usage_reason
 from llm_d_lens.infrastructure.kubernetes import run_kubectl
 
 _store = deployment_run_manager.store
@@ -1197,6 +1197,8 @@ async def delete_execution(execution_id: str, *, delete_namespace: bool = True) 
                 f"deployment runtime is unavailable, so cluster resources cannot be cleaned: {error}",
                 code="deployment_runtime_unavailable",
             ) from error
+        except DeploymentInUseError as error:
+            raise DeploymentExecutionConflictError(str(error), code="deployment_in_use") from error
         except ValueError as error:
             raise DeploymentExecutionConflictError(str(error)) from error
     _execution_locks.pop(execution_id, None)

@@ -691,3 +691,22 @@ def test_router_ablations_preserve_published_source_and_cluster_for_retry():
     direct = router._baseline_configuration(source, "direct-vllm", ["plan-a"], "artifact-a")
     assert direct.provenance["cluster_ref"]["id"] == "original-cluster"
     assert "officialGuide" not in direct.content
+
+
+def test_a_case_that_failed_by_exception_does_not_block_its_own_cleanup(monkeypatch):
+    from llm_d_lens.deploy import usage
+
+    workflow = {
+        "id": "w1",
+        "status": "running",
+        "cases": [{"id": "c1", "status": "benchmarking", "execution_id": "e1"}],
+    }
+    monkeypatch.setattr(router, "_records", lambda kind: [workflow] if kind == "workflow" else [])
+    monkeypatch.setattr(usage, "_probes", {"evaluate": router._deployment_usage_reason})
+    # The failure status is only written after the cleanup in `finally` has run.
+    with pytest.raises(usage.DeploymentInUseError):
+        usage.require_unused("e1")
+    with router._deployment_cleanup_guard("e1"):
+        usage.require_unused("e1")
+    with pytest.raises(usage.DeploymentInUseError):
+        usage.require_unused("e1")

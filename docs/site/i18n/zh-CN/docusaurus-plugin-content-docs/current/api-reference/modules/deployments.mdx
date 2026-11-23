@@ -623,6 +623,12 @@ def simulation_projection(execution: DeploymentExecution) -> SimulationDeploymen
 
 ## 后端 API
 
+停止、清理、重启及删除操作会先检查 Deploy 注册的 usage probe，再修改工作负载或删除记录。
+活跃 evaluation 消费者及已发布的 model-service member 会以 HTTP `409` 和
+`deployment_in_use` 阻止操作；销毁前需先取消发布 member。probe 失败时保守拒绝操作。
+删除 run 会在开始清理前检查所有 case。Python worker 调用者收到
+`deploy.usage.DeploymentInUseError`（`ValueError` 子类）。这些状态检查不提供针对并发启动消费者的原子预留锁。
+
 Guide 兼容端点保留 `{ "error": "..." }` 响应结构。
 预期的校验失败保留可操作的错误提示及状态码。
 目录加载和准备阶段的非预期错误返回通用 `502` 响应；

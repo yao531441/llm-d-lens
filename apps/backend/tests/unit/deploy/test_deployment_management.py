@@ -628,6 +628,66 @@ async def test_failed_cleanup_keeps_the_deployment_records(deployment_store, wor
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["stop", "clean", "restart", "delete_case", "delete_run"])
+@pytest.mark.parametrize("probe_fails", [False, True])
+async def test_worker_lifecycle_preserves_borrowed_deployments(
+    deployment_store, worker_factory, operation, probe_fails
+):
+    service = FakeDeploymentService()
+    worker = worker_factory(service)
+    run = deployment_store.get_run("run-1")
+    if operation == "restart":
+        run.cases[0].status = DeploymentCaseStatus.FAILED
+        deployment_store.save_run(run)
+
+    def probe(_execution_id):
+        if probe_fails:
+            raise RuntimeError("consumer store unavailable")
+        return "active benchmark"
+
+    usage.register_usage_probe("evaluate", probe)
+    with pytest.raises(usage.DeploymentInUseError):
+        if operation == "delete_run":
+            await worker.delete_run("run-1")
+        elif operation == "delete_case":
+            await worker.delete_case_execution("run-1", "case-0", delete_namespace=False)
+        else:
+            await getattr(worker, f"{operation}_case")("run-1", "case-0")
+    assert service.cleaned == []
+    assert deployment_store.get_run("run-1").cases == run.cases
+    assert deployment_store.get_execution("execution-ready").status == DeploymentStatus.READY
+
+
+@pytest.mark.asyncio
+async def test_delete_run_preflights_every_case_before_cleanup(deployment_store, worker_factory):
+    service = FakeDeploymentService()
+    worker = worker_factory(service)
+    usage.register_usage_probe(
+        "evaluate", lambda execution_id: "active benchmark" if execution_id == "execution-cleaned" else None
+    )
+    with pytest.raises(usage.DeploymentInUseError):
+        await worker.delete_run("run-1")
+    assert service.cleaned == []
+    assert deployment_store.get_execution("execution-ready") is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["stop", "clean"])
+async def test_case_route_reports_native_usage_conflict(deployment_store, worker_factory, monkeypatch, operation):
+    worker = worker_factory(FakeDeploymentService())
+    monkeypatch.setattr(router, "_store", deployment_store)
+    monkeypatch.setattr(router.deployment_run_manager, "worker_for_run", lambda _run_id: worker)
+    usage.register_usage_probe("evaluate", lambda _execution_id: "active benchmark")
+    response = (
+        await router.stop_case("run-1", "case-0")
+        if operation == "stop"
+        else await router.clean_case("run-1", "case-0", router.CleanCaseRequest())
+    )
+    assert response.status_code == 409
+    assert _payload(response)["code"] == "deployment_in_use"
+
+
+@pytest.mark.asyncio
 async def test_delete_is_refused_when_the_cluster_session_is_gone(deployment_store, worker_factory):
     worker_factory(FakeDeploymentService(), lifecycle_error="cluster session is no longer active")
 

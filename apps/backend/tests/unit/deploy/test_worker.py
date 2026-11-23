@@ -44,7 +44,7 @@ def test_restart_preserves_retry_eligibility_until_new_attempt_is_created(monkey
             service = SimpleNamespace(clean=AsyncMock(return_value=SimpleNamespace(status=cleanup_status)))
             worker = DeploymentRunWorker(store, service)
             worker._require_active_cluster_session = Mock()
-            worker._case_execution = Mock(return_value=(run, case, SimpleNamespace()))
+            worker._case_execution = Mock(return_value=(run, case, SimpleNamespace(execution_id="execution")))
             worker._execute_retry = AsyncMock()
 
             def create_retry(self, run_id, case_id, case=case, run=run, retry=retry):
