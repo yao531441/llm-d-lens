@@ -8,7 +8,7 @@ import TabItem from '@theme/TabItem';
 
 ## Backend API
 
-Lens Assistant uses `llm_d_lens.mcp.router` in the unified Python service. Its FastAPI router exposes the stateless Streamable HTTP endpoint at `/api/mcp` using the official MCP Python SDK.
+Lens Assistant uses `llm_d_lens.assistant_tools.router` in the unified Python service. Its FastAPI router exposes the stateless Streamable HTTP endpoint at `/api/assistant/mcp` using the official MCP Python SDK.
 
 Candidate tools advertise and forward either `workload.concurrency` or
 `workload.request_rate` (positive, mutually exclusive load targets). The compatibility
@@ -25,7 +25,7 @@ Handle one stateless Streamable HTTP MCP request with a fresh SDK server and tra
 <Tabs>
   <TabItem value="rest-api" label="REST API">
 
-**`POST /api/mcp`**
+**`POST /api/assistant/mcp`**
 
 Request:
 
@@ -82,7 +82,7 @@ If an unhandled server error occurs before the SDK sends a response, Lens return
   </TabItem>
   <TabItem value="python-api" label="Python API">
 
-Use the official MCP Python client for transport calls. For metadata, `llm_d_lens.mcp.catalog.catalog(app)` returns the same tool definitions used by the endpoint. In-process domain integrations can reuse the helper shown on the [Deployments](/api-reference/modules/deployments) page:
+Use the official MCP Python client for transport calls. For metadata, `llm_d_lens.assistant_tools.catalog.catalog(app)` returns the same tool definitions used by the endpoint. In-process domain integrations can reuse the helper shown on the [Deployments](/api-reference/modules/deployments) page:
 
 ```python
 from llm_d_lens.deploy.standard_kubernetes_service import (
@@ -111,7 +111,7 @@ Return `405 Method not allowed.` because stateless mode does not support the Str
 <Tabs>
   <TabItem value="rest-api" label="REST API">
 
-**`GET /api/mcp`**
+**`GET /api/assistant/mcp`**
 
 Request:
 
@@ -147,7 +147,7 @@ Return `405 Method not allowed.` because stateless mode does not support session
 <Tabs>
   <TabItem value="rest-api" label="REST API">
 
-**`DELETE /api/mcp`**
+**`DELETE /api/assistant/mcp`**
 
 Request:
 
@@ -176,7 +176,7 @@ The Python router rejects session termination because it keeps no transport sess
   </TabItem>
 </Tabs>
 
-`llm_d_lens.mcp.catalog` derives tools from the FastAPI OpenAPI schema and combines them with 25 special definitions in `llm_d_lens/mcp/definitions.json`. `node hack/generate-mcp-tools.mjs --check` validates this catalog without generating Node files. `llm_d_lens.mcp.tools` invokes the canonical REST routes through an in-process ASGI client, preserving authentication, CSRF and resource-scope checks.
+`llm_d_lens.assistant_tools.catalog` derives tools from the FastAPI OpenAPI schema and combines them with 25 special definitions in `llm_d_lens/assistant_tools/definitions.json`. `node hack/generate-mcp-tools.mjs --check` validates this catalog without generating Node files. `llm_d_lens.assistant_tools.tools` invokes the canonical REST routes through an in-process ASGI client, preserving authentication, CSRF and resource-scope checks.
 
 ## What the MCP tools call
 
@@ -190,7 +190,7 @@ Representative generated MCP tools forward straight into existing Python-backed 
 | `get_cluster_stack_status` | `GET /api/v1/monitoring/cluster-stack/status` | [Observability](/api-reference/modules/observability) via `llm_d_lens/monitoring/cluster_stack/router.py` |
 | `list_simulation_tasks` | `GET /api/simulation/tasks` | [Simulation](/api-reference/modules/simulation) via `llm_d_lens/simulation/router.py` |
 
-If you need Python rather than MCP transport, call the underlying Python domains directly instead of `/api/mcp`. For example, the MCP tool `create_standard_vllm_deployment_run` ultimately reaches the same deployment helper used by `POST /api/v1/deployments/standard-vllm-runs`:
+If you need Python rather than MCP transport, call the underlying Python domains directly instead of `/api/assistant/mcp`. For example, the MCP tool `create_standard_vllm_deployment_run` ultimately reaches the same deployment helper used by `POST /api/v1/deployments/standard-vllm-runs`:
 
 ```python
 from llm_d_lens.deploy.standard_kubernetes_service import (

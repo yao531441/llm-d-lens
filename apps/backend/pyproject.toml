@@ -86,7 +86,7 @@ include = ["llm_d_lens*"]
 [tool.setuptools.package-data]
 "llm_d_lens.hardware" = ["schema.json", "profiles/*.json"]
 "llm_d_lens.versions" = ["*.yaml"]
-"llm_d_lens.mcp" = ["definitions.json"]
+"llm_d_lens.assistant_tools" = ["definitions.json"]
 "llm_d_lens.configuration" = ["optimization_catalog.json"]
 "llm_d_lens.db.migrations" = ["README.md", "script.py.mako"]
 

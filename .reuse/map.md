@@ -374,7 +374,7 @@ Entry: [apps/backend/src/llm_d_lens/agentic/generator.py](../apps/backend/src/ll
 ## agentic-aic-relaxed-mcp-search
 
 Expose a bounded AIC latency-relaxation search to Agentic via an audited MCP tool and cluster-derived GPU budget.
-Entry: [apps/backend/src/llm_d_lens/mcp/tools.py](../apps/backend/src/llm_d_lens/mcp/tools.py) — `invoke_tool`
+Entry: [apps/backend/src/llm_d_lens/assistant_tools/tools.py](../apps/backend/src/llm_d_lens/assistant_tools/tools.py) — `invoke_tool`
 
 ## agentic-deterministic-ranking
 

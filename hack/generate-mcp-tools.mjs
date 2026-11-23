@@ -27,7 +27,7 @@ if (args.some(argument => !['--check', '--json'].includes(argument))) {
     process.exit(2);
 }
 
-const result = spawnSync(python, ['-m', 'llm_d_lens.mcp.catalog'], {
+const result = spawnSync(python, ['-m', 'llm_d_lens.assistant_tools.catalog'], {
     cwd: root,
     encoding: 'utf8',
     maxBuffer: 16 * 1024 * 1024,

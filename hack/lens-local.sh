@@ -670,7 +670,7 @@ regenerate_mcp_tools() {
     fi
     mkdir -p "$LOG_DIR"
     log "validating MCP tool catalog from the backend API..."
-    if ! .venv/bin/python -c 'from llm_d_lens.api.main import app; from llm_d_lens.mcp.catalog import catalog; print(f"Validated {len(catalog(app))} MCP tools")' >"$LOG_DIR/generate-mcp-tools.log" 2>&1; then
+    if ! .venv/bin/python -c 'from llm_d_lens.api.main import app; from llm_d_lens.assistant_tools.catalog import catalog; print(f"Validated {len(catalog(app))} MCP tools")' >"$LOG_DIR/generate-mcp-tools.log" 2>&1; then
         fail "MCP tool catalog validation failed; see $LOG_DIR/generate-mcp-tools.log"
         return 1
     fi
@@ -793,7 +793,7 @@ start_services() {
     start_one backend env \
         PRISM_MODEL_API_PUBLIC_HOST="$PRISM_MODEL_API_PUBLIC_HOST" \
         PRISM_GPU_PCI_ALLOWLIST="$PRISM_GPU_PCI_ALLOWLIST" \
-        PRISM_MCP_URL="$scheme://127.0.0.1:$BACKEND_PORT/api/mcp" \
+        PRISM_MCP_URL="$scheme://127.0.0.1:$BACKEND_PORT/api/assistant/mcp" \
         PRISM_MCP_CA_FILE="${TLS_CERT_FILE:-}" \
         LENS_INTERNAL_AUTH_SECRET="$LENS_INTERNAL_AUTH_SECRET" \
         LENS_MODEL_GATEWAY_AUTHZ_TLS_INSECURE="$authz_tls_insecure" \
