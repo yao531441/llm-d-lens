@@ -59,6 +59,7 @@ docs/design/*
 !docs/design/cluster-design.md
 !docs/design/database-design.md
 !docs/design/hardware-plugin-architecture.md
+!docs/design/mcp-agent-task-tools-design.md
 !docs/design/mcp-playground-design.md
 !docs/design/model-service-design.md
 !docs/design/observability-design.md
