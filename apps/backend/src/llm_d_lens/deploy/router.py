@@ -21,6 +21,7 @@ from llm_d_lens.auth.access import (
     visible_cluster_ids,
 )
 from llm_d_lens.db.dao.deployment_batch import DeploymentBatchDao
+from llm_d_lens.deploy import verification
 from llm_d_lens.deploy.application import deployment_run_manager
 from llm_d_lens.deploy.contracts import (
     DeploymentCaseStatus,
@@ -59,6 +60,7 @@ from llm_d_lens.deploy.standard_kubernetes_service import (
     build_standard_kubernetes_service_configuration,
 )
 from llm_d_lens.deploy.usage import DeploymentInUseError
+from llm_d_lens.deploy.verification_checks import VerificationRequest
 from llm_d_lens.hardware.resolver import deployment_mode
 from llm_d_lens.infrastructure.kubernetes import PortForwardError, list_resources
 
@@ -312,6 +314,7 @@ async def _refresh_deployment_records() -> None:
 @router.on_event("startup")
 async def start_deployment_record_refresh() -> None:
     global _refresh_task
+    verification.fail_interrupted_verifications()
     for run in _store.list_runs():
         if run.status == DeploymentRunStatus.CANCELLING:
             deployment_run_manager.reconcile_interrupted_cancellation(run.id)
@@ -660,6 +663,7 @@ def _execution_payload(context, principal, owner=None):
         case_id=context.case_id,
         ownership=ownership,
         capabilities={
+            "connect": allowed("deployment:execution:connect"),
             "update": allowed("deployment:execution:update"),
             "stop": allowed("deployment:case:execute", run_only=True),
             "delete": allowed("deployment:execution:delete"),
@@ -1016,6 +1020,59 @@ async def get_execution_pod_logs(
         "logs": logs,
         "success": result.returncode == 0,
     }
+
+
+@router.post(
+    "/executions/{execution_id}/verifications",
+    status_code=202,
+    operation_id="create_deployment_verification",
+    summary="Start a bounded deployment verification.",
+    description="Persist and start a small inference check on the Lens host. Returns a verification id immediately; "
+    "read its persisted result without replaying requests. The request budget includes prefix warmup.",
+)
+async def create_verification(execution_id: str, request: VerificationRequest, http_request: Request = None):
+    context = find_execution_context(execution_id)
+    if context is None:
+        raise HTTPException(status_code=404, detail="deployment execution not found")
+    principal = current_principal(http_request)
+    _require_execution_permission(principal, context, "deployment:execution:connect")
+    try:
+        return verification.start_verification(execution_id, request)
+    except ValueError as error:
+        return problem(409, "Verification cannot start", str(error), "deployment_conflict")
+
+
+@router.get(
+    "/executions/{execution_id}/verifications",
+    operation_id="list_deployment_verifications",
+    summary="List persisted deployment verifications.",
+    description="Read the most recent 20 verification records attached to this execution. Does not send inference "
+    "requests or advance task lifecycle. Records survive stop and clean, and are removed with the execution.",
+)
+async def list_verifications(execution_id: str, request: Request = None):
+    context = find_execution_context(execution_id)
+    if context is None:
+        raise HTTPException(status_code=404, detail="deployment execution not found")
+    _require_execution_permission(current_principal(request), context, "deployment:run:read")
+    return {"items": verification.list_verifications(execution_id)}
+
+
+@router.get(
+    "/executions/{execution_id}/verifications/{verification_id}",
+    operation_id="get_deployment_verification",
+    summary="Get a persisted deployment verification.",
+    description="Read a verification's lifecycle, request budget, actual counts and evidence-qualified verdict. "
+    "Reads never send requests or resume an interrupted task.",
+)
+async def get_verification(execution_id: str, verification_id: str, request: Request = None):
+    context = find_execution_context(execution_id)
+    if context is None:
+        raise HTTPException(status_code=404, detail="deployment execution not found")
+    _require_execution_permission(current_principal(request), context, "deployment:run:read")
+    try:
+        return verification.get_verification(execution_id, verification_id)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
 
 
 @router.patch(

@@ -1,5 +1,13 @@
 import { streamSseRequest } from '../../../shared/api/sse.js';
-import { postJson } from '../../../shared/api/httpClient.js';
+import { postJson, requestJson } from '../../../shared/api/httpClient.js';
+
+export function listDeploymentVerifications(executionId, signal) {
+    return requestJson(`/api/v1/deployments/executions/${encodeURIComponent(executionId)}/verifications`, { signal });
+}
+
+export function startDeploymentVerification(executionId, checks, requests) {
+    return postJson(`/api/v1/deployments/executions/${encodeURIComponent(executionId)}/verifications`, { checks, requests });
+}
 
 export const DEFAULT_REQUIREMENTS = {
     objective: 'balanced', maxAccelerators: '', ttftMs: '', tpotMs: '', providerRef: '', plannerPrompt: '',

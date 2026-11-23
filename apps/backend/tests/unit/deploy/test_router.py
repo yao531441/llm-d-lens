@@ -751,7 +751,7 @@ async def test_list_ready_executions_is_side_effect_free_and_filtered(monkeypatc
         "run_id": "run-1",
         "case_id": "case-execution-ready",
         "ownership": "unknown",
-        "capabilities": {"update": False, "stop": False, "delete": False},
+        "capabilities": {"connect": False, "update": False, "stop": False, "delete": False},
         "status": "ready",
         "cluster_id": "cluster-1",
         "cluster_session_id": "session-1",

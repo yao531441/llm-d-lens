@@ -16,6 +16,7 @@ from llm_d_lens.deploy.contracts import (
     DeploymentMetadata,
     DeploymentMetadataUpdateRequest,
     DeploymentRun,
+    VersionedPayload,
     utcnow,
 )
 
@@ -207,6 +208,35 @@ class DeploymentEvidenceDao(BaseDao):
             session.flush()
             return row.to_dto()
 
+    def update_verification(self, execution_id: str, record: dict, *, create: bool = False) -> DeploymentExecution:
+        """Update one bounded verification record without overwriting runtime diagnostics."""
+        with self._transaction() as session:
+            row = session.get(DeploymentExecutionRow, execution_id, with_for_update=True)
+            if row is None:
+                raise DeploymentDaoError("deployment execution not found")
+            current = row.to_dto()
+            value = dict(current.diagnostics.value if current.diagnostics else {})
+            records = [dict(item) for item in value.get("verifications", [])]
+            if create:
+                if current.status.value != "ready":
+                    raise ValueError("deployment must be ready before verification")
+                if any(item["status"] in {"queued", "running"} for item in records):
+                    raise ValueError("a deployment verification is already active")
+                records = [record, *records][:20]
+            else:
+                item = next((item for item in records if item["id"] == record["id"]), None)
+                if item is None:
+                    raise DeploymentDaoError("deployment verification not found")
+                item.update(record)
+            value["verifications"] = records
+            current.diagnostics = VersionedPayload(
+                schema_version=current.diagnostics.schema_version if current.diagnostics else "v1", value=value
+            )
+            current.updated_at = utcnow()
+            row.sync_from_dto(current, cluster_id=_resolve_cluster_id(current.provenance))
+            session.flush()
+            return row.to_dto()
+
     def delete(self, execution_id: str) -> None:
         with self._transaction() as session:
             row = session.get(DeploymentExecutionRow, execution_id, with_for_update=True)
@@ -247,4 +277,11 @@ def _apply_preserved_execution_fields(
         monitoring_setup is None or persisted.monitoring_setup.get("status") != "enabling"
     ):
         monitoring_setup = persisted.monitoring_setup
-    return execution.model_copy(update={"metadata": persisted.metadata, "monitoring_setup": monitoring_setup})
+    diagnostics = execution.diagnostics
+    if persisted.diagnostics and "verifications" in persisted.diagnostics.value:
+        value = dict(diagnostics.value if diagnostics else {})
+        value["verifications"] = persisted.diagnostics.value["verifications"]
+        diagnostics = VersionedPayload(schema_version=diagnostics.schema_version if diagnostics else "v1", value=value)
+    return execution.model_copy(
+        update={"metadata": persisted.metadata, "monitoring_setup": monitoring_setup, "diagnostics": diagnostics}
+    )

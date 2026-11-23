@@ -20,6 +20,7 @@ import {
 import { Modal } from '../../../../shared/ui/Modal';
 import { YamlPreview } from '../../../evaluation';
 import { getDeploymentExecutionPlan } from '../../../optimization';
+import { DeploymentVerificationPanel } from './DeploymentVerificationPanel';
 import {
     deploymentEndpoint,
     deploymentKind,
@@ -313,6 +314,10 @@ export function DeploymentDetailsModal({ deployment, clusterNameById = {}, onClo
                 <DeploymentPlanSection key={deployment.execution_id} deployment={deployment} />
 
                 {/* Section 6: Audit & Timeline */}
+                {!deployment.pending && deployment.execution_id && (
+                    <DeploymentVerificationPanel key={deployment.execution_id} executionId={deployment.execution_id}
+                        status={deployment.status} canConnect={deployment.capabilities?.connect === true} />
+                )}
                 <SectionCard icon={Clock} title="Audit & Timeline">
                     <dl className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                         <Fact label="Execution ID" value={deployment.execution_id} mono copyable />
