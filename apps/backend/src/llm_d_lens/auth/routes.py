@@ -16,7 +16,7 @@ from dataclasses import dataclass
 PUBLIC: None = None
 AUTHENTICATED = ""
 
-_PARAM_ALLOW_SLASH = {"repo_id", "rest"}
+_PARAM_ALLOW_SLASH = {"repo_id", "rest", "name"}
 
 #: Methods Envoy's HTTP ext_authz may forward to the authorize endpoint.
 _EXT_AUTH_METHODS = ("POST", "PUT", "PATCH", "DELETE", "GET")
@@ -290,6 +290,8 @@ ROUTE_PERMISSIONS: tuple[RoutePermission, ...] = (
     RoutePermission("DELETE", "/api/v1/evaluate/runs/{run_id}", "evaluate:run:delete"),
     RoutePermission("GET", "/api/v1/evaluate/runs/{run_id}", "evaluate:run:read"),
     RoutePermission("POST", "/api/v1/evaluate/runs/{run_id}/cancel", "evaluate:run:cancel"),
+    RoutePermission("GET", "/api/v1/evaluate/runs/{run_id}/artifacts", "evaluate:run:read"),
+    RoutePermission("GET", "/api/v1/evaluate/runs/{run_id}/artifacts/{name}", "evaluate:run:read"),
     RoutePermission("GET", "/api/v1/evaluate/workflow-runs", "evaluate:run:read"),
     RoutePermission("POST", "/api/v1/evaluate/workflow-runs", "evaluate:workflow:create"),
     RoutePermission("DELETE", "/api/v1/evaluate/workflow-runs/{workflow_id}", "evaluate:run:delete"),

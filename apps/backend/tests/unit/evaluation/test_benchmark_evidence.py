@@ -804,3 +804,61 @@ def test_read_lifecycle_artifact_enforces_deadline(tmp_path, monkeypatch):
     monkeypatch.setattr(evidence.time, "monotonic", lambda: next(clock, 16.0))
     with pytest.raises(ValueError, match="Lifecycle archive read timed out"):
         evidence.read_lifecycle_artifact(tmp_path / "summary.json", "config.yaml")
+
+
+def _artifact_router(monkeypatch, run_record):
+    router = importlib.import_module("llm_d_lens.evaluation.router")
+    monkeypatch.setattr(router, "_get", lambda kind, run_id: run_record if run_id == run_record["id"] else None)
+    return router
+
+
+def test_run_artifacts_list_and_download_loose_reports(monkeypatch, tmp_path):
+    (tmp_path / "per_request_lifecycle_metrics.json").write_text('[{"stage_id": 0}]')
+    (tmp_path / "stage_0_lifecycle_metrics.json").write_text("{}")
+    (tmp_path / "notes.txt").write_text("not a report")
+    run_record = {"id": "run-1", "metrics": {"summary_path": str(tmp_path / "summary_lifecycle_metrics.json")}}
+    router = _artifact_router(monkeypatch, run_record)
+
+    listing = asyncio.run(router.list_run_artifacts("run-1"))
+    assert listing == {
+        "items": [
+            {"name": "per_request_lifecycle_metrics.json", "size_bytes": 17},
+            {"name": "stage_0_lifecycle_metrics.json", "size_bytes": 2},
+        ],
+        "archived_in": [],
+    }
+    response = asyncio.run(router.get_run_artifact("run-1", "per_request_lifecycle_metrics.json"))
+    assert response.body == b'[{"stage_id": 0}]'
+    assert response.media_type == "application/json"
+
+
+def test_run_artifacts_serve_matrix_points_and_archived_members(monkeypatch, tmp_path):
+    point = tmp_path / "matrix-1"
+    point.mkdir()
+    _write_workspace_archive(point, [("./config.yaml", b"data: {}\n", "file")])
+    run_record = {
+        "id": "run-1",
+        "matrix_results": [{}, {"metrics": {"summary_path": str(point / "summary_lifecycle_metrics.json")}}],
+    }
+    router = _artifact_router(monkeypatch, run_record)
+
+    assert asyncio.run(router.list_run_artifacts("run-1")) == {"items": [], "archived_in": ["matrix-1"]}
+    response = asyncio.run(router.get_run_artifact("run-1", "matrix-1/config.yaml"))
+    assert response.body == b"data: {}\n"
+    assert response.media_type == "application/yaml"
+
+
+def test_run_artifacts_reject_unknown_names_runs_and_missing_reports(monkeypatch, tmp_path):
+    run_record = {"id": "run-1", "metrics": {"summary_path": str(tmp_path / "summary_lifecycle_metrics.json")}}
+    router = _artifact_router(monkeypatch, run_record)
+
+    def status(call):
+        with pytest.raises(router.HTTPException) as error:
+            asyncio.run(call)
+        return error.value.status_code
+
+    assert status(router.get_run_artifact("run-1", "../../etc/passwd")) == 422
+    assert status(router.get_run_artifact("run-1", "other.json")) == 422
+    assert status(router.get_run_artifact("run-1", "matrix-9/config.yaml")) == 404
+    assert status(router.get_run_artifact("run-1", "per_request_lifecycle_metrics.json")) == 404
+    assert status(router.list_run_artifacts("missing")) == 404

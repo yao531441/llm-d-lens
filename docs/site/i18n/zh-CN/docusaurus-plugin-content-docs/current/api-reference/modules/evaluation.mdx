@@ -582,6 +582,50 @@ if run is not None and run.get("status") in {"succeeded", "failed", "cancelled"}
   </TabItem>
 </Tabs>
 
+
+### 列出基准测试运行的报告
+
+列出基准测试 harness 为一次运行保存的 lifecycle 报告：汇总、各阶段和逐请求文件，以及 harness 配置。矩阵运行把每个点的文件加上 `matrix-N/` 前缀。只保存在 workspace 归档里的报告不会逐个列出；其目录出现在 `archived_in` 中，仍可按标准文件名下载。
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`GET /api/v1/evaluate/runs/{run_id}/artifacts`**
+
+    响应：`items[]`（`name`、`size_bytes`）和 `archived_in[]`。
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    from llm_d_lens.evaluation.router import list_run_artifacts
+
+    listing = await list_run_artifacts("7d698fda-8e2e-44b2-86aa-14d24098350d")
+    print([item["name"] for item in listing["items"]])
+    ```
+  </TabItem>
+</Tabs>
+
+### 下载基准测试运行的报告
+
+返回一份报告的原始字节，例如逐请求记录的 `per_request_lifecycle_metrics.json`。支持最大 64 MiB 的文件，来源是散落文件或该运行的 workspace 归档。文件名不在 lifecycle 报告集合内返回 `422`；报告未保存或无法读取返回 `404`。
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`GET /api/v1/evaluate/runs/{run_id}/artifacts/{name}`**
+
+    - 路径参数：`run_id`（`string`，必填）、`name`（`string`，必填；`config.yaml`、`summary_lifecycle_metrics.json`、`stage_<n>_lifecycle_metrics.json` 或 `per_request_lifecycle_metrics.json`，可加 `matrix-N/` 前缀）
+
+    响应：报告正文，`application/json`（`config.yaml` 为 `application/yaml`）。
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    from llm_d_lens.evaluation.router import get_run_artifact
+
+    response = await get_run_artifact(
+        "7d698fda-8e2e-44b2-86aa-14d24098350d", "per_request_lifecycle_metrics.json"
+    )
+    rows = response.body
+    ```
+  </TabItem>
+</Tabs>
 ### 启动一次“部署+基准测试”工作流
 
 启动一个简单的“部署+基准测试”工作流：先创建一个经过优化的基线部署，然后对其进行基准测试。

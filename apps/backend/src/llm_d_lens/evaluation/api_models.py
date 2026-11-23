@@ -105,6 +105,19 @@ class BenchmarkRunListResponse(BaseModel):
     items: list[BenchmarkRunResponse]
 
 
+class BenchmarkArtifact(BaseModel):
+    name: str = Field(description="Path to pass to the artifact download endpoint.")
+    size_bytes: int
+
+
+class BenchmarkArtifactListResponse(BaseModel):
+    items: list[BenchmarkArtifact]
+    archived_in: list[str] = Field(
+        default_factory=list,
+        description="Directories whose reports are kept only in a workspace archive; names are still downloadable.",
+    )
+
+
 class EvaluationWorkflowListResponse(BaseModel):
     items: list[EvaluationWorkflowResponse]
 
