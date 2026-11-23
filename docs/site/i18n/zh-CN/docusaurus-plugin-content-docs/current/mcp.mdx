@@ -4,70 +4,153 @@ description: 将一个 MCP 客户端（MCP Inspector、某个 IDE 智能体，�
 ---
 
 Lens 将其平台能力以 **Model Context Protocol (MCP)** 服务器的形式暴露出来，
-这样任何支持 MCP 的客户端都可以像内置的
-[Lens Assistant](/user-guide/lens-assistant) 一样检查和操作 Lens。MCP 层是一个**瘦适配层**：
+这样任何支持 MCP 的客户端都可以在 Lens 上规划、部署和压测 llm-d。MCP 层是一个**瘦适配层**：
 每一个工具都是通过进程内 ASGI 客户端调用 Lens 自身的 REST API；MCP 服务器中没有重新实现
-任何集群、认证或领域逻辑。
+任何集群、认证或领域逻辑。内置的 [Lens Assistant](/user-guide/lens-assistant) 使用另一套
+生成的工具目录，位于 `/api/assistant/mcp`；它是内部端点，本文不作介绍。
 
 ## 端点与传输方式
 
 | 属性 | 值 |
 | --- | --- |
-| 方法 / 路径 | `POST /api/assistant/mcp`（位于统一 Python 服务上） |
+| 方法 / 路径 | `POST /api/mcp`，位于统一 Python 服务上 |
 | 默认端口 | `BACKEND_PORT`，后备值为 `SERVER_PORT` / `PORT`（默认 3000；本地启动器会选择空闲端口） |
 | 传输方式 | MCP **Streamable HTTP**，JSON-RPC 2.0 |
 | 会话 | **无状态**——每个请求使用一个临时的 MCP 服务器，没有 `Mcp-Session-Id` |
-| 其他方法 | `GET` / `DELETE /api/assistant/mcp` 返回 `405`（无状态模式下没有服务器到客户端的流） |
+| 其他方法 | `GET` / `DELETE /api/mcp` 返回 `405`（无状态模式下没有服务器到客户端的流） |
 
 该端点特意设计为无状态：它可以水平扩展，并且每一个工具都会重新从 REST API
 读取**实时**数据，因此响应结果始终反映当前状态。
 
 ## 认证
 
-`POST /api/assistant/mcp` 需要一个**已登录的会话**，该会话需持有以下权限之一：
+`POST /api/mcp` 接受**个人访问 token**或登录会话，所属用户需持有以下权限之一：
 
 - `mcp:tool:invoke`，或者
 - `playground:chat:use`
 
-可以通过浏览器 Cookie **`prism_session`** 或者通过 Bearer 令牌发送会话凭据：
+在 **Account → Personal access tokens** 创建 token，填写名称和 1–365 天的有效期（默认 30 天），
+复制仅展示一次的明文，通过 Bearer 请求头发送：
 
 ```
-Authorization: ******
+Authorization: Bearer <personal-access-token>
 ```
 
-`<session-token>` 是登录时颁发的 `prism_session` Cookie 的值（可以在登录状态下从
-浏览器开发者工具中读取）。Python 认证服务直接校验会话；
-未认证的调用会得到 `401 unauthenticated`，
-而没有上述权限的会话会得到 `403`。
+token 实时继承用户的角色和资源范围。在同一账户弹窗中可查看有效期、最近使用时间并单独撤销。
+修改或重置密码、禁用账户会使 token 失效；新浏览器登录和退出登录不会撤销独立 token。
+无效凭据返回 `401 unauthenticated`，缺少权限返回 `403`。
+浏览器仍使用 `prism_session` 和 CSRF；登录会话的 Bearer 用法也继续支持。
 
 :::note
-面向**第三方** MCP 客户端的专用凭据（API 密钥 / OAuth 权限范围）是一项
-计划中的、独立的设计——目前外部客户端复用的是已登录的会话。相关的开放性问题
-请参阅 `docs/design/mcp-playground-design.md`（第 4 阶段）。
+PAT 不能管理凭据或签发其他 token；凭据管理必须使用正常登录会话。
+`lens-pat-*` 与模型推理密钥 `lens-mk-*` 独立。OAuth scope 和服务账户不在本次功能范围内。
 :::
 
-## 工具
+## Task tools
 
-工具目录是从 Lens 的 REST 接口生成的，并按领域分组。每个工具都带有一个
-**风险等级**：
+MCP 服务器面向任务，运行在 Lens 进程内，围绕“规划、部署、压测 llm-d”的流程设计，
+而不是镜像 REST 操作。它用**你自己的凭据**在进程内调用 Lens REST，因此能看到、也只能修改你在 Web UI
+中有权限操作的内容。所有状态都在 Lens：MCP 服务器没有自己的数据库、队列、租约或 token。
+id 就是 Lens id（部署即其 Lens run id），Web UI 或智能体创建的资源都可以通过任一入口读取和使用。
 
-| 等级 | 含义 | 示例 |
-| --- | --- | --- |
-| `read` | 只读查看 | `list_clusters`、`list_deployments`、`get_deployment_pod_logs`、`get_flow_map_metrics`、`list_storage_volumes`、`search_huggingface_models` |
-| `write` | 会改变状态（创建 / 启动 / 停止 / 安装） | `create_simulation_task`、`start_cluster_bootstrap`、`create_standard_vllm_deployment_run`、`install_gpu_driver`、`create_ai_provider` |
-| `approve` | 具有破坏性；需要明确确认 | `delete_cluster`、`delete_configuration_artifact`、`delete_deployment_execution`、`delete_evaluation_workflow`、`delete_ai_provider` |
+工具按 profile 分组，由 `LENS_MCP_PROFILES` 设置（逗号分隔，默认 `core`）。
+profile 只限制服务器提供哪些工具；每次调用仍会再次校验 Lens 权限。
 
-在运行时通过 `tools/list` 可以发现确切的、最新的工具列表（名称会随着模块
-演进而变化）。所有工具都返回 JSON；调用失败时会返回一个 MCP 错误结果
-（`isError: true`），其消息就是底层的 REST 错误信息。
+| Profile | 工具 |
+| --- | --- |
+| `core` | `cluster_list`、`cluster_get`、`placement_probe`、`guide_list`、`model_search`、`model_get`、`model_cache_create`、`deployment_plan`、`deployment_create`、`deployment_get`、`deployment_diagnose`、`deployment_test`、`deployment_logs`、`deployment_stop`、`experiment_plan`、`experiment_start`、`experiment_get`、`experiment_artifact_get`、`experiment_cancel`、`experiment_retry`、`result_compare`、`resource_list`、`resource_delete` |
+| `serving` | `model_service_publish`、`model_service_get`、`model_service_test`、`model_service_update`、`model_service_access_grant`、`model_service_access_revoke` |
+| `storage` | `storage_volume_create`、`storage_volume_get`、`storage_volume_scan` |
+| `simulation` | `trace_dataset_list`、`trace_dataset_prepare`、`simulation_start`、`simulation_get`、`simulation_cancel` |
+| `lens-settings` | `ai_provider_list`、`ai_provider_test` |
+| `cluster-admin` | `cluster_component_check`、`cluster_component_install`、`image_prepull`、`model_gateway_configure`、`model_gateway_reconcile`、`orphan_resource_list`、`orphan_resource_delete` |
+
+`cluster-admin` 会改动共享基础设施，除非运维人员需要，否则应保持关闭。
+
+容量与放置由 Lens 提供。`cluster_get(include=["topology"])` 显示每个节点的 PCIe root，以及哪些 root 完全空闲。
+`placement_probe` 接收拓扑的各个角色（例如 prefill 与 decode，含 `replicas` 和 `tensorParallelSize`），
+返回当前能否放下、放在哪些节点，或放不下的原因。结果仅供参考，因为容量可能在部署开始前变化。
+
+`resource_list(kinds=["deployment"], owner="me")` 也包含 Web UI 创建且由 Lens 判定归你所有的部署。
+读取返回 `run_id`、`case_id`、`execution_id`、相对归属状态和 Lens 计算的 `capabilities`；控制操作遵循这些 capabilities。
+MCP 服务器只修改你拥有的资源。`resource_delete` 使用 `items: [{"kind":"deployment","id":"...","name":"..."}]`，
+每个 `name` 都必须与 id 匹配，否则整批都不会删除。删除存储卷时总是保留模型文件。
+
+Lens 在停止、清理和删除前检查已注册的消费者。活跃 evaluation 和已发布的 model-service member 会阻止这些操作；
+销毁部署前需先取消发布。usage probe 失败也会阻止清理。这些检查基于当前状态，不提供针对并发启动消费者的原子预留锁。
+
+### 持久化部署检查
+
+`deployment_test` 启动 Lens 原生检查，返回 `verification_id`、任务 `status`，
+完成后另外返回 `verdict` 和逐项证据。`wait_seconds` 控制等待时间（0–25，默认 25）。
+仍在 queued/running 时，传入相同 `deployment_id` 和 `verification_id` 读取结果，不会重新发送请求。
+可用 `deployment_get(include=["verifications"])` 查找历史，包括创建请求响应丢失的情况。
+新检查仅支持 `chat` 与 `prefix_cache`；旧记录仍可读取。
+Web 的 **Deployment Management → 部署详情 → Deployment verification** 可发起相同检查，
+并自动刷新同一份已保存历史。
+
+```json
+{"deployment_id":"execution-example","checks":["chat","prefix_cache"],"requests":10,"wait_seconds":0}
+```
+
+`requests` 是总上限（1–20），已包含 prefix cache 检查的六次串行重复前缀请求（总预算至少 10）。
+每次请求最多要求 16 个输出 token。结果保存已尝试、收到 HTTP 响应、成功请求数及服务端报告的
+输出 token 数；这些计数不保证服务端遵守 token 限制。检查在 Lens 主机运行，没有总时限，单个请求超时为 10 秒。
+请求不会自动重放；后端重启时遗留的未完成任务在下次启动时标记失败。读取接口不改变生命周期。
+
+任务 `succeeded` 表示检查执行完成，不代表全部通过。chat 只验证能否返回 completion；
+响应报告正数 cached-token 可证明缓存使用，零值或缺失保持 inconclusive。
+即使其他请求存在网络错误，已经观察到的 HTTP 或 completion 失败仍使 chat 判定失败。
+缺少请求级计数时，不支持 KV-transfer、routing 或 rank 检查。不会保存模型回复文本。
+活跃检查会阻止部署销毁准入；此检查不是与并发销毁互斥的原子预留。
+最近 20 条记录保存于 execution diagnostics，stop/clean 后保留，删除 execution 历史时移除。
+复用现有存储，无需新表或迁移。创建需资源范围内的 `deployment:execution:connect`，
+读取需 `deployment:run:read`。
+
+task tools 在 `experiment_plan` / `experiment_start` 输入 schema 中
+直接展示 Lens 原生 `BenchmarkScenario`、`BenchmarkSpec`、SLA 目标和 baseline 参数。
+通过 `tools/list` 检查嵌套 workload 字段与范围，无需猜测键名。
+scenario 和 baseline 校验在规划或保存配置 artifact 之前执行。
+Lens 仍按自身版本再次校验请求。
+
+实验 guide 字段中的 `modelPath` 是 worker 节点上的绝对路径；省略来源时隐含
+`modelSource: "shared-path"`。渲染后的配置将其保留为 `runtime.mountPath`，
+供 Lens 核对 manifest 的存储来源。`runtimeImage` 同时传给 guide 规划与渲染。
+
+`deployment_plan` 和 `deployment_create` 接受 `configuration`，其 guide 字段与实验 `common`、`variants[].plan` 相同；
+或用 `from_deployment_id` 克隆可见部署，保留完整 Lens 配置及存储绑定。二者只能选其一。
+`cluster_id` 放在配置外；`deployment_name`、`description` 和 `model_cache_volume_id` 是可选的部署上下文。
+`deployment_plan` 只校验和渲染、不创建任何资源，并返回 `digest`；将其作为 `expected_digest` 传给
+`deployment_create`，若期间计划发生变化，创建会以 `plan_stale` 失败。部署读取包含 `configuration`。
+
+```json
+{"cluster_id":"cluster-example","configuration":{"guide":"optimized-baseline","model":"Qwen/Qwen3-0.6B","tensorParallelSize":1,"maxNumSeqs":64}}
+```
+
+单部署与实验的共享 guide 字段均支持 `source` 和 `customPatches`：
+
+- `source: {"mode":"official"}`（默认）使用集群固定版本的 llm-d 来源与 catalog。
+- `source: {"mode":"local","path":"/allowed/guides/kustomization.yaml"}` 读取
+  **Lens 主机**上的路径，受 `PRISM_GUIDE_LOCAL_ROOTS` 限制。可选 `ref` 仅是来源标签，
+  不会固定 working-tree 内容。
+- `source: {"mode":"remote","repository":"owner/repo","path":"guides/model.yaml","ref":"main"}`
+  由 Lens 将 GitHub ref 解析为 commit。local/remote 不要求属于固定版本的官方 catalog，
+  但选定的 manifest 仍须通过 Lens 校验。
+- `customPatches` 最多接受 20 个对象，包含 `path`（展示标签）和 `content`（资源 YAML，
+  每个文件最多 262144 UTF-8 bytes）。Lens 按 `kind` 和可选 `metadata.name` 匹配文档，
+  按 name 合并数组，未匹配资源会追加并返回警告；歧义匹配报错。
+  它与 RFC 7396 克隆补丁不同，也不是 JSON Patch 或通用 merge-patch 请求。
+
+规划返回解析后的 `source` 和 `applied_custom_patches`；Lens 配置保留渲染后的 manifest
+及来源记录。本地 working tree 返回的 commit 或回退 hash 本身不能证明全部内容已固定。
 
 ## 连接客户端
 
 ### MCP Inspector
 
 1. 启动 Lens 开发技术栈（`hack/lens-local.sh start`）。
-2. 在 MCP Inspector 中选择 **Streamable HTTP**，URL 填写 `http://<lens-host>:3000/api/assistant/mcp`。
-3. 添加请求头 `Authorization: ******`，然后点击**连接**并列出工具。
+2. 在 MCP Inspector 中选择 **Streamable HTTP**，URL 填写 `http://<lens-host>:3000/api/mcp`。
+3. 添加请求头 `Authorization: Bearer <personal-access-token>`，然后点击**连接**并列出工具。
 
 ### 通用 MCP 客户端配置
 
@@ -76,9 +159,9 @@ Authorization: ******
   "mcpServers": {
     "lens": {
       "type": "http",
-      "url": "http://<lens-host>:3000/api/assistant/mcp",
+      "url": "http://<lens-host>:3000/api/mcp",
       "headers": {
-        "Authorization": "******"
+        "Authorization": "Bearer <personal-access-token>"
       }
     }
   }
@@ -88,8 +171,8 @@ Authorization: ******
 ### 原生 JSON-RPC
 
 ```bash
-BASE=http://<lens-host>:3000/api/assistant/mcp
-H="Authorization: ******"
+BASE=http://<lens-host>:3000/api/mcp
+H="Authorization: Bearer <personal-access-token>"
 
 # 1) 握手
 curl -s "$BASE" -H "$H" -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d '{
@@ -103,14 +186,13 @@ curl -s "$BASE" -H "$H" -H 'content-type: application/json' -H 'accept: applicat
 # 3) 调用一个只读工具
 curl -s "$BASE" -H "$H" -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d '{
   "jsonrpc":"2.0","id":3,"method":"tools/call",
-  "params":{"name":"list_clusters","arguments":{}}}'
+  "params":{"name":"cluster_list","arguments":{}}}'
 ```
 
 ## 说明
 
-- 工具分为只读/写入/需确认三种类型；`approve` 等级应当只在一个人工
-  确认步骤之后才被调用（正如 Lens Assistant 的界面所做的那样）——智能体不得自动批准这类操作。
-- MCP 服务器从不直接与集群通信：它调用的是 Lens 的 REST 接口，而该接口
-  应用的是与 UI 相同的认证、RBAC 和作用域规则。
-- 由于该传输方式是无状态的，所以不需要每次调用都执行一次新的 `initialize`，
-  但每个请求仍然必须携带上述凭据。
+- 破坏性工具（`deployment_stop`、`experiment_cancel`、`resource_delete` 以及所有 `cluster-admin` 工具）带有
+  `destructiveHint`；宿主应在调用前请求人工确认。
+- 任务工具以 MCP 错误结果（`isError: true`）返回失败，其中包含稳定的 `code`、出错的 `field`，以及指向下一个工具的 `hint`。
+- MCP 服务器从不直接与集群通信：它调用的是 Lens 的 REST 接口，而该接口应用的是与 UI 相同的认证、RBAC 和作用域规则。
+- 由于该传输方式是无状态的，所以不需要每次调用都执行一次新的 `initialize`，但每个请求仍然必须携带上述凭据。
