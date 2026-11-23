@@ -884,6 +884,13 @@ async def test_invalid_arguments_report_every_problem(api, ctx):
 
 
 @pytest.mark.asyncio
+async def test_resource_list_explains_an_empty_result(api, ctx):
+    api.on("GET", "/evaluate/workflow-runs", {"items": []})
+    payload, _ = await call_tool(ctx, "resource_list", {"kinds": ["experiment"]})
+    assert payload["count"] == 0 and "owner='all'" in payload["empty_note"]
+
+
+@pytest.mark.asyncio
 async def test_diagnose_does_not_blame_capacity_for_a_pod_that_is_already_placed(api, ctx):
     deployment_id = await create(api, ctx)
     placed = {**pod("a", "decode", ready=False, phase="Pending", reason="ContainerCreating"), "node_name": "smc-19"}
