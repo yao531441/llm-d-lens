@@ -46,7 +46,7 @@ def pd_configuration(prefill_replicas=2, prefill_tp=1, decode_replicas=2, decode
 def test_pd_baselines_default_to_total_card_budget(baseline_type):
     source = pd_configuration()
     original = deepcopy(source.content)
-    baseline = router._baseline_configuration(source, baseline_type, ["plan"], "artifact")
+    baseline = router.baseline_configuration(source, baseline_type, ["plan"], "artifact")
     assert baseline.content["decode"] == {"replicaCount": 4, "tensorParallelSize": 1}
     assert "prefill" not in baseline.content
     assert source.content == original
@@ -65,7 +65,7 @@ def test_pd_baselines_default_to_total_card_budget(baseline_type):
     ],
 )
 def test_pd_budget_uses_effective_tp_and_honors_explicit_replicas(shape, parameters, replicas, tp):
-    baseline = router._baseline_configuration(
+    baseline = router.baseline_configuration(
         pd_configuration(*shape),
         "direct-vllm",
         ["plan"],
@@ -86,7 +86,7 @@ def test_pd_budget_uses_effective_tp_and_honors_explicit_replicas(shape, paramet
 )
 def test_pd_budget_rejects_unrepresentable_automatic_replicas(shape, parameters):
     with pytest.raises(ValueError, match="GPU budget"):
-        router._baseline_configuration(
+        router.baseline_configuration(
             pd_configuration(*shape),
             "direct-vllm",
             ["plan"],
@@ -97,7 +97,7 @@ def test_pd_budget_rejects_unrepresentable_automatic_replicas(shape, parameters)
 
 def test_non_pd_baseline_keeps_decode_replica_default():
     source = pd_configuration().model_copy(update={"provider_ref": "optimized-baseline"})
-    baseline = router._baseline_configuration(source, "direct-vllm", ["plan"], "artifact")
+    baseline = router.baseline_configuration(source, "direct-vllm", ["plan"], "artifact")
     assert baseline.content["decode"]["replicaCount"] == 2
 
 
@@ -131,7 +131,7 @@ def test_ds_budget_uses_rendered_requests_slices_and_group_size():
         },
     }
     source.content["officialGuide"] = {"renderedManifest": yaml.safe_dump(document)}
-    baseline = router._baseline_configuration(source, "direct-vllm", ["plan"], "artifact")
+    baseline = router.baseline_configuration(source, "direct-vllm", ["plan"], "artifact")
     assert baseline.content["decode"]["replicaCount"] == 12
     assert baseline.content["comparisonBudget"]["sourcePodCount"] == 8
     assert baseline.content["comparisonBudget"]["scope"] == "accelerator-request-only"
@@ -139,7 +139,7 @@ def test_ds_budget_uses_rendered_requests_slices_and_group_size():
 
 def test_pd_baseline_manifest_requests_four_single_card_replicas(monkeypatch):
     monkeypatch.setattr("llm_d_lens.deploy.providers.baseline_vllm.gpu_device_selectors", lambda **_: [])
-    baseline = router._baseline_configuration(pd_configuration(), "direct-vllm", ["plan"], "artifact")
+    baseline = router.baseline_configuration(pd_configuration(), "direct-vllm", ["plan"], "artifact")
     resources = BaselineVllmAdapter._resources(BaselineVllmAdapter._parameters(baseline.content))
     deployment = next(resource for resource in resources if resource["kind"] == "Deployment")
     claim = next(resource for resource in resources if resource["kind"] == "ResourceClaimTemplate")

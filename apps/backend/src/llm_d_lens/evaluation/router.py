@@ -232,7 +232,7 @@ def _baseline_key(configuration: DeployableConfiguration, benchmark: dict) -> st
     return configuration_checksum(payload)
 
 
-def _baseline_configuration(
+def baseline_configuration(
     source: DeployableConfiguration,
     baseline_type: str,
     workload_ids: list[str],
@@ -4290,7 +4290,7 @@ async def create_evaluation(request: EvaluationCreateRequest, http_request: Requ
         source_artifact_id = source_plan.configuration_artifact_id
         source_artifact = artifacts[source_artifact_id]
         try:
-            baseline = _baseline_configuration(
+            baseline = baseline_configuration(
                 source_artifact.deployable_configuration,
                 case.get("baseline_type", "direct-vllm"),
                 case["workload_ids"],

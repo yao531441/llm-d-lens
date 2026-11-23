@@ -67,7 +67,7 @@ def test_explicit_baseline_types_select_expected_provider(baseline_type, provide
         checksum=configuration_checksum(content),
     )
 
-    baseline = router._baseline_configuration(source, baseline_type, ["workload"], "artifact")
+    baseline = router.baseline_configuration(source, baseline_type, ["workload"], "artifact")
 
     assert baseline.provider_ref == provider_ref
     assert baseline.content.get("routerProfile") == router_profile
@@ -90,7 +90,7 @@ def test_comparison_core_parameters_override_generated_baseline():
         checksum=configuration_checksum(content),
     )
 
-    baseline = router._baseline_configuration(
+    baseline = router.baseline_configuration(
         source,
         "direct-vllm",
         ["workload"],
@@ -682,13 +682,13 @@ def test_router_ablations_preserve_published_source_and_cluster_for_retry():
         provenance={"cluster_ref": {"id": "original-cluster"}},
     )
     for kind in ["router-neutral", "affinity-only", "load-only"]:
-        baseline = router._baseline_configuration(source, kind, ["plan-a"], "artifact-a")
+        baseline = router.baseline_configuration(source, kind, ["plan-a"], "artifact-a")
         assert baseline.content["officialGuide"] == content["officialGuide"]
         assert baseline.content["guideSettings"] == content["guideSettings"]
         assert baseline.provenance["cluster_ref"]["id"] == "original-cluster"
         assert baseline.content["routerProfile"] == kind
         assert "routerProfile" not in source.content
-    direct = router._baseline_configuration(source, "direct-vllm", ["plan-a"], "artifact-a")
+    direct = router.baseline_configuration(source, "direct-vllm", ["plan-a"], "artifact-a")
     assert direct.provenance["cluster_ref"]["id"] == "original-cluster"
     assert "officialGuide" not in direct.content
 
