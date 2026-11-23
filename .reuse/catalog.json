@@ -1317,19 +1317,19 @@
       "boundaries": "The AI path starts with deployment intent and requests get_cluster_overview before submitting proposals. The server runs cluster overview before AIC search and overrides the AI-supplied GPU budget with live capacity in the selected mode. An AIC no-feasible-configurations 400 is treated as an empty candidate result, retaining its error detail, so search_aic_with_relaxation can use cluster-derived GPU capacity and invoke the bounded AIC search API; its anchor is not SLO proof. A valid relaxed anchor is preserved as a separate bounded proposal when not already submitted; the same resource validator checks it before exact-topology estimation. Other AIC errors do not trigger relaxation. AI proposals are untrusted and cannot score, select, approve, render, or deploy. Only allowlisted planning MCP tools are exposed and executed. Explicit numeric ISL, OSL, TTFT and TPOT constraints in operator preference take precedence over the corresponding structured fields for AI generation, AIC search and SLO filtering; otherwise AIC search uses server-normalized structured inputs. Concurrency is a planning workload signal, not an AIC search input. Generator tool traces retain the effective AIC search arguments and result. Partial valid output is accepted; deterministic fallback resolves facts through internal domain services. Run planning_trace records facts, validation, ranking and selection.",
       "examples": [
         "apps/backend/src/llm_d_lens/agentic/service.py",
-        "apps/backend/src/llm_d_lens/mcp/tools.py",
+        "apps/backend/src/llm_d_lens/assistant_tools/tools.py",
         "apps/backend/src/llm_d_lens/simulation/candidate_search.py"
       ],
       "tests": [
         "apps/backend/tests/unit/agentic/test_generator.py",
         "apps/backend/tests/unit/agentic/test_service.py",
         "apps/backend/tests/contract/test_candidate_search.py",
-        "apps/backend/tests/contract/test_mcp.py"
+        "apps/backend/tests/contract/test_assistant_tools.py"
       ]
     },
     {
       "id": "agentic-aic-relaxed-mcp-search",
-      "path": "apps/backend/src/llm_d_lens/mcp/tools.py",
+      "path": "apps/backend/src/llm_d_lens/assistant_tools/tools.py",
       "symbols": [
         "invoke_tool"
       ],
@@ -1340,7 +1340,7 @@
         "apps/backend/src/llm_d_lens/simulation/candidate_search.py"
       ],
       "tests": [
-        "apps/backend/tests/contract/test_mcp.py",
+        "apps/backend/tests/contract/test_assistant_tools.py",
         "apps/backend/tests/contract/test_candidate_search.py",
         "apps/backend/tests/unit/agentic/test_generator.py"
       ]

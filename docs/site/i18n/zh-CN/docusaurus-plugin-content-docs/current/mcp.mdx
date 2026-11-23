@@ -13,18 +13,18 @@ Lens 将其平台能力以 **Model Context Protocol (MCP)** 服务器的形式�
 
 | 属性 | 值 |
 | --- | --- |
-| 方法 / 路径 | `POST /api/mcp`（位于统一 Python 服务上） |
+| 方法 / 路径 | `POST /api/assistant/mcp`（位于统一 Python 服务上） |
 | 默认端口 | `BACKEND_PORT`，后备值为 `SERVER_PORT` / `PORT`（默认 3000；本地启动器会选择空闲端口） |
 | 传输方式 | MCP **Streamable HTTP**，JSON-RPC 2.0 |
 | 会话 | **无状态**——每个请求使用一个临时的 MCP 服务器，没有 `Mcp-Session-Id` |
-| 其他方法 | `GET` / `DELETE /api/mcp` 返回 `405`（无状态模式下没有服务器到客户端的流） |
+| 其他方法 | `GET` / `DELETE /api/assistant/mcp` 返回 `405`（无状态模式下没有服务器到客户端的流） |
 
 该端点特意设计为无状态：它可以水平扩展，并且每一个工具都会重新从 REST API
 读取**实时**数据，因此响应结果始终反映当前状态。
 
 ## 认证
 
-`POST /api/mcp` 需要一个**已登录的会话**，该会话需持有以下权限之一：
+`POST /api/assistant/mcp` 需要一个**已登录的会话**，该会话需持有以下权限之一：
 
 - `mcp:tool:invoke`，或者
 - `playground:chat:use`
@@ -66,7 +66,7 @@ Authorization: ******
 ### MCP Inspector
 
 1. 启动 Lens 开发技术栈（`hack/lens-local.sh start`）。
-2. 在 MCP Inspector 中选择 **Streamable HTTP**，URL 填写 `http://<lens-host>:3000/api/mcp`。
+2. 在 MCP Inspector 中选择 **Streamable HTTP**，URL 填写 `http://<lens-host>:3000/api/assistant/mcp`。
 3. 添加请求头 `Authorization: ******`，然后点击**连接**并列出工具。
 
 ### 通用 MCP 客户端配置
@@ -76,7 +76,7 @@ Authorization: ******
   "mcpServers": {
     "lens": {
       "type": "http",
-      "url": "http://<lens-host>:3000/api/mcp",
+      "url": "http://<lens-host>:3000/api/assistant/mcp",
       "headers": {
         "Authorization": "******"
       }
@@ -88,7 +88,7 @@ Authorization: ******
 ### 原生 JSON-RPC
 
 ```bash
-BASE=http://<lens-host>:3000/api/mcp
+BASE=http://<lens-host>:3000/api/assistant/mcp
 H="Authorization: ******"
 
 # 1) 握手

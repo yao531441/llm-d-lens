@@ -50,12 +50,12 @@ class McpResponse(Response):
             await manager.handle_request(scope, receive, send)
 
 
-@router.post("/api/mcp")
+@router.post("/api/assistant/mcp")
 async def mcp(request: Request):
     return McpResponse(request)
 
 
-@router.api_route("/api/mcp", methods=["GET", "DELETE"])
+@router.api_route("/api/assistant/mcp", methods=["GET", "DELETE"])
 async def unsupported_method():
     return JSONResponse(
         {"jsonrpc": "2.0", "error": {"code": -32000, "message": "Method not allowed."}, "id": None}, status_code=405

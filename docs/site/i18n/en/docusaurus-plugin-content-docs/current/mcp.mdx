@@ -13,18 +13,18 @@ re-implemented in the MCP server.
 
 | Property | Value |
 | --- | --- |
-| Method / path | `POST /api/mcp` (on the unified Python service) |
+| Method / path | `POST /api/assistant/mcp` (on the unified Python service) |
 | Default port | `BACKEND_PORT`, falling back to `SERVER_PORT` / `PORT` (3000; the local launcher selects a free port) |
 | Transport | MCP **Streamable HTTP**, JSON-RPC 2.0 |
 | Session | **Stateless** — one ephemeral MCP server per request, no `Mcp-Session-Id` |
-| Other methods | `GET` / `DELETE /api/mcp` return `405` (no server→client stream in stateless mode) |
+| Other methods | `GET` / `DELETE /api/assistant/mcp` return `405` (no server→client stream in stateless mode) |
 
 The endpoint is stateless on purpose: it scales horizontally and every tool re-reads
 **live** data from the REST API, so responses always reflect the current state.
 
 ## Authentication
 
-`POST /api/mcp` requires a **signed-in session** that holds one of these permissions:
+`POST /api/assistant/mcp` requires a **signed-in session** that holds one of these permissions:
 
 - `mcp:tool:invoke`, or
 - `playground:chat:use`
@@ -66,7 +66,7 @@ evolve). All tools return JSON; a failing call comes back as an MCP error result
 ### MCP Inspector
 
 1. Start the Lens dev stack (`hack/lens-local.sh start`).
-2. In MCP Inspector choose **Streamable HTTP**, URL `http://<lens-host>:3000/api/mcp`.
+2. In MCP Inspector choose **Streamable HTTP**, URL `http://<lens-host>:3000/api/assistant/mcp`.
 3. Add header `Authorization: Bearer <session-token>`, then **Connect** and list tools.
 
 ### Generic MCP client config
@@ -76,7 +76,7 @@ evolve). All tools return JSON; a failing call comes back as an MCP error result
   "mcpServers": {
     "lens": {
       "type": "http",
-      "url": "http://<lens-host>:3000/api/mcp",
+      "url": "http://<lens-host>:3000/api/assistant/mcp",
       "headers": {
         "Authorization": "Bearer <session-token>"
       }
@@ -88,7 +88,7 @@ evolve). All tools return JSON; a failing call comes back as an MCP error result
 ### Raw JSON-RPC
 
 ```bash
-BASE=http://<lens-host>:3000/api/mcp
+BASE=http://<lens-host>:3000/api/assistant/mcp
 H="Authorization: Bearer <session-token>"
 
 # 1) handshake

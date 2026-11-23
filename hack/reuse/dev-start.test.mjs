@@ -75,7 +75,7 @@ printf '%s\\n' "$PRISM_MCP_URL" "$PRISM_MCP_CA_FILE" "$@"
     });
     assert.equal(result.status, 0, result.stderr);
     const lines = result.stdout.trim().split('\n');
-    assert.deepEqual(lines.slice(0, 2), ['https://127.0.0.1:4100/api/mcp', customCa || '/cert with spaces.pem']);
+    assert.deepEqual(lines.slice(0, 2), ['https://127.0.0.1:4100/api/assistant/mcp', customCa || '/cert with spaces.pem']);
     assert.equal(lines[lines.indexOf('--ssl-certfile') + 1], '/cert with spaces.pem');
     assert.equal(lines[lines.indexOf('--port') + 1], '4100');
   }

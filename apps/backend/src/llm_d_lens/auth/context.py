@@ -100,7 +100,7 @@ def _source(request: Request) -> str:
     if declared in {"assistant", "background"} and request.headers.get("x-prism-principal-id"):
         return declared
     if request.headers.get("x-prism-principal-id"):
-        return "assistant" if request.url.path == "/api/mcp" else "api"
+        return "assistant" if request.url.path == "/api/assistant/mcp" else "api"
     return "api"
 
 
