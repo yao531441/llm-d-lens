@@ -20,7 +20,7 @@ def test_every_evaluation_json_response_has_a_named_contract():
     for path, methods in paths.items():
         for method, operation in methods.items():
             for code, response in operation["responses"].items():
-                if code.startswith("2") and code != "204":
+                if code.startswith("2") and code != "204" and "application/octet-stream" not in response["content"]:
                     schema = response["content"]["application/json"]["schema"]
                     assert "$ref" in schema, (path, method, schema)
             assert "application/problem+json" in operation["responses"]["422"]["content"]

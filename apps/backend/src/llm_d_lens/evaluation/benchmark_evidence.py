@@ -122,13 +122,16 @@ def _declared_hardware(run: dict) -> HardwareDescriptor:
     return hardware
 
 
+LIFECYCLE_ARTIFACT_NAME = re.compile(r"config\.yaml|(?:summary|stage_\d+|per_request)_lifecycle_metrics\.json")
+
+
 def read_lifecycle_artifact(summary_path: str | Path, name: str) -> bytes | None:
     """Read one bounded sibling artifact, loose or in its own workspace archive.
 
     No archive member is extracted to disk. Only lifecycle/config members are
     accepted, and ambiguous duplicate members are rejected.
     """
-    if not re.fullmatch(r"(?:config\.yaml|(?:summary|stage_\d+|per_request)_lifecycle_metrics\.json)", name):
+    if not LIFECYCLE_ARTIFACT_NAME.fullmatch(name):
         raise ValueError("Unsupported lifecycle artifact name")
     root = Path(summary_path).parent
     path = root / name
