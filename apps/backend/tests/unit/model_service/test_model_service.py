@@ -89,6 +89,19 @@ def _service() -> ModelService:
 # --- tokens ------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("status", ["active", "draining", "disabled"])
+def test_published_member_blocks_deployment_lifecycle_until_unpublished(monkeypatch, status):
+    import importlib
+
+    router = importlib.import_module("llm_d_lens.model_service.router")
+    members = [SimpleNamespace(execution_id="exec-1", group_id="model-1", status=status)]
+    monkeypatch.setattr(router, "_service", SimpleNamespace(list_members=lambda: members))
+    assert "unpublish" in router._deployment_usage_reason("exec-1")
+    assert router._deployment_usage_reason("exec-other") is None
+    members.clear()
+    assert router._deployment_usage_reason("exec-1") is None
+
+
 def test_generated_token_has_prefix_and_hash_is_stable():
     raw = generate_model_token()
     assert raw.startswith("lens-mk-")

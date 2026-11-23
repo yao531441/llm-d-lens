@@ -760,6 +760,14 @@ print(sorted(variants))
 
 ## Backend API
 
+Stop, clean, restart and delete operations check Deploy's registered usage probes
+before changing workloads or removing records. Active evaluation consumers and
+published model-service members block these operations with HTTP `409` and code
+`deployment_in_use`; unpublish members before teardown. Probe failures fail closed.
+Run deletion checks every case before starting cleanup. Python worker callers
+receive `deploy.usage.DeploymentInUseError` (a `ValueError`). These state checks
+do not reserve the deployment atomically against a concurrently starting consumer.
+
 Guide compatibility endpoints keep the `{ "error": "..." }` response shape.
 Expected validation failures retain their actionable message and status.
 Unexpected catalog/preparation failures return a generic `502` response; unexpected

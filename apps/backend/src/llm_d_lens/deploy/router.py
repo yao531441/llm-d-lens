@@ -58,6 +58,7 @@ from llm_d_lens.deploy.standard_kubernetes_service import (
     StandardKubernetesServiceRequest,
     build_standard_kubernetes_service_configuration,
 )
+from llm_d_lens.deploy.usage import DeploymentInUseError
 from llm_d_lens.hardware.resolver import deployment_mode
 from llm_d_lens.infrastructure.kubernetes import PortForwardError, list_resources
 
@@ -1262,13 +1263,15 @@ async def get_run(run_id: str, request: Request = None):
     ),
     operation_id="delete_deployment_run",
 )
-async def delete_run(run_id: str, request: Request = None) -> None:
+async def delete_run(run_id: str, request: Request = None):
     run = _store.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="deployment run not found")
     _require_run_permission(current_principal(request), run, "deployment:execution:delete")
     try:
         await deployment_run_manager.worker_for_run(run_id).delete_run(run_id)
+    except DeploymentInUseError as error:
+        return problem(409, "Deployment is in use", str(error), "deployment_in_use")
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
 
@@ -1396,6 +1399,8 @@ async def stop_case(run_id: str, case_id: str, request: Request = None):
         _require_run_permission(current_principal(request), run, "deployment:case:execute")
     try:
         case, execution = await deployment_run_manager.worker_for_run(run_id).stop_case(run_id, case_id)
+    except DeploymentInUseError as error:
+        return problem(409, "Deployment is in use", str(error), "deployment_in_use")
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     return _case_response(case, execution)
@@ -1434,6 +1439,8 @@ async def restart_case(run_id: str, case_id: str, request: RestartCaseRequest, h
         case = await deployment_run_manager.worker_for_run(run_id).restart_case(
             run_id, case_id, model_token=(request.model_token or "").strip() or None
         )
+    except DeploymentInUseError as error:
+        return problem(409, "Deployment is in use", str(error), "deployment_in_use")
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     return {"case": case}
@@ -1456,6 +1463,8 @@ async def clean_case(run_id: str, case_id: str, request: CleanCaseRequest, http_
         case, execution = await deployment_run_manager.worker_for_run(run_id).clean_case(
             run_id, case_id, preserve_rendered_overlay=request.preserve_rendered_overlay
         )
+    except DeploymentInUseError as error:
+        return problem(409, "Deployment is in use", str(error), "deployment_in_use")
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     return _case_response(case, execution)
