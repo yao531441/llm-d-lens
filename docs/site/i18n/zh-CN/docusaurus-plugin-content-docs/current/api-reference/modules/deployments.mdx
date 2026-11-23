@@ -647,6 +647,13 @@ Guide 兼容端点保留 `{ "error": "..." }` 响应结构。
 [存储环境设置](/environment-variables)。旧 `.llm-d-bench/deploy` 和主机专属的
 `/root/.llm_d_lens/run_store` 不再是当前存储契约。
 执行发现使用 `execution_id` 作为跨模块引用，列表查询不会建立端口转发。
+
+execution 列表与详情 REST 响应还返回 `run_id`、`case_id`、`ownership`（`self`、`other`、`unknown`）
+和 `capabilities`（`update`、`stop`、`delete`）。能力按当前调用者及写操作相同的 RBAC 规则计算，
+仅供提示，写操作仍会重新鉴权；不会返回 owner 用户/组 ID。来源 run 存在时，详情中的
+`configuration` 是按 case 的 `source_configuration_ordinal` 选出的完整 `DeployableConfiguration`。
+这是保存的配置，不是从手动扩缩容后的现场状态重建的配置。
+Python `ExecutionContext.api_payload()` 保持中立运行时投影；调用者相关字段由 REST router 添加。
 需要主机可达地址时应调用执行端点连接操作，不能假定持久化的集群内地址或旧隧道仍然可达。
 
 | 记录 | 生命周期状态 |

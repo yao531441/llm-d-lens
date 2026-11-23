@@ -361,8 +361,18 @@ async def test_list_returns_all_deployments_with_metadata_fields(deployment_stor
     for item in response["items"]:
         assert item["display_name"] == ""
         assert item["description"] == ""
-        assert "run_id" not in item
-        assert "case_id" not in item
+        assert item["run_id"] == "run-1"
+        assert item["case_id"]
+
+
+@pytest.mark.asyncio
+async def test_execution_detail_returns_exact_case_source_configuration(deployment_store, monkeypatch):
+    monkeypatch.setattr(router, "_store", deployment_store)
+    payload = await router.get_execution("execution-ready")
+    run = deployment_store.get_run("run-1")
+    assert payload["configuration"] == run.source_configurations[0].model_dump(mode="json")
+    assert payload["run_id"] == "run-1"
+    assert payload["case_id"] == run.cases[0].id
 
 
 @pytest.mark.asyncio

@@ -629,6 +629,44 @@ def _require_execution(execution_id: str):
     return context
 
 
+def _execution_payload(context, principal, owner=None):
+    """Expose canonical links and existing policy decisions without exposing owner identities."""
+    if owner is None:
+        owner = _owner_for_run(context.run_id)
+    user_id, group_id = owner if owner else (None, None)
+    ownership = "unknown" if not user_id else "self" if principal and user_id == principal.user_id else "other"
+
+    def allowed(permission, *, run_only=False):
+        if principal is None:
+            return False
+        return any(
+            resource_readable(
+                principal,
+                permission=permission,
+                resource_type=kind,
+                resource_id=identifier,
+                cluster_id=context.cluster_id,
+                owner_user_id=user_id,
+                owner_group_id=group_id,
+            )
+            for kind, identifier in (("deployment_run", context.run_id), ("deployment_execution", context.execution_id))
+            if identifier and (not run_only or kind == "deployment_run")
+        )
+
+    payload = context.api_payload()
+    payload.update(
+        run_id=context.run_id,
+        case_id=context.case_id,
+        ownership=ownership,
+        capabilities={
+            "update": allowed("deployment:execution:update"),
+            "stop": allowed("deployment:case:execute", run_only=True),
+            "delete": allowed("deployment:execution:delete"),
+        },
+    )
+    return payload
+
+
 def _list_runs(query: str = "", principal=None):
     needle = query.lower().strip()
     runs = list(reversed(_store.list_runs()))
@@ -740,12 +778,12 @@ async def list_executions(
         limit=limit,
         allowed_cluster_ids=visible_cluster_ids(principal),
     )
+    owners = DeploymentBatchDao().owner_map([context.run_id for context in contexts])
     if principal is not None:
-        owners = DeploymentBatchDao().owner_map([context.run_id for context in contexts])
         contexts = [
             context for context in contexts if _execution_readable(principal, context, owners.get(context.run_id))
         ]
-    return {"items": [context.api_payload() for context in contexts]}
+    return {"items": [_execution_payload(context, principal, owners.get(context.run_id)) for context in contexts]}
 
 
 @router.get(
@@ -764,8 +802,14 @@ async def get_execution(execution_id: str, request: Request = None):
     context = find_execution_context(execution_id)
     if context is None:
         raise HTTPException(status_code=404, detail="deployment execution not found")
-    _require_execution_permission(current_principal(request), context, "deployment:run:read")
-    return context.api_payload()
+    principal = current_principal(request)
+    _require_execution_permission(principal, context, "deployment:run:read")
+    payload = _execution_payload(context, principal)
+    run = _store.get_run(context.run_id) if context.run_id else None
+    case = next((case for case in run.cases if case.id == context.case_id), None) if run else None
+    if case and 0 <= case.source_configuration_ordinal < len(run.source_configurations):
+        payload["configuration"] = run.source_configurations[case.source_configuration_ordinal].model_dump(mode="json")
+    return payload
 
 
 @router.get(

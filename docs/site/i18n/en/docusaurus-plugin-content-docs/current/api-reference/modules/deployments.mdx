@@ -881,6 +881,16 @@ reference; listing does not start port-forwards. Use the execution endpoint
 action to obtain a host-reachable URL rather than assuming a persisted
 in-cluster endpoint or old tunnel is reachable.
 
+Execution list/detail REST responses additionally expose `run_id`, `case_id`,
+`ownership` (`self`, `other`, `unknown`) and `capabilities` (`update`, `stop`, `delete`).
+Capabilities are calculated for the authenticated caller using the same RBAC checks
+as writes; they are advisory and writes reauthorize. Owner user/group ids are not
+returned. Detail includes `configuration`, the exact source `DeployableConfiguration`
+selected by that case's `source_configuration_ordinal`, when the source run exists.
+It is the saved configuration, not a reconstruction of live manual scaling.
+The Python `ExecutionContext.api_payload()` remains a neutral runtime projection;
+the REST router adds caller-specific fields.
+
 | Record | Lifecycle states |
 | --- | --- |
 | Run | `queued`, `running`, `succeeded`, `partially_succeeded`, `failed`, `cleaned`, `cancelling`, `cancelled` |
