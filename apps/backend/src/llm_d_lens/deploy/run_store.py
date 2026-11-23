@@ -92,6 +92,9 @@ class JsonDeploymentRunStore:
             execution.metadata = DeploymentMetadata()
         return execution
 
+    def update_execution_verification(self, execution_id: str, record: dict, *, create: bool = False):
+        return self._executions.update_verification(execution_id, record, create=create)
+
     def list_executions(self) -> list[DeploymentExecution]:
         return self._executions.list()
 
