@@ -140,6 +140,7 @@ Cover the profile contract and its consumers, not only one vendor.
 | Type | Directory | Filename | Export |
 | --- | --- | --- | --- |
 | Assistant tool catalog (`/api/assistant/mcp`) | `apps/backend/src/llm_d_lens/assistant_tools/` | `snake_case.py` | snake_case function |
+| Task MCP (`/api/mcp`) | `apps/backend/src/llm_d_lens/mcp/` | `snake_case.py` | snake_case function |
 | Python shared base types | `apps/backend/src/llm_d_lens/core/` | `snake_case.py` | PascalCase class |
 | Python HTTP adaptation | `apps/backend/src/llm_d_lens/api/` | `snake_case.py` | snake_case function |
 | Python technical adapter | `apps/backend/src/llm_d_lens/infrastructure/<capability>/` | Responsibility-based `snake_case.py` | snake_case function; PascalCase class |
