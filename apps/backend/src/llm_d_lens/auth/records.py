@@ -22,6 +22,19 @@ def utcnow() -> datetime:
 
 
 @dataclass
+class PersonalAccessTokenRecord:
+    user_id: str
+    name: str
+    token_prefix: str
+    token_hash: str = field(repr=False)
+    expires_at: datetime
+    id: str = field(default_factory=new_id)
+    created_at: datetime = field(default_factory=utcnow)
+    last_used_at: datetime | None = None
+    revoked_at: datetime | None = None
+
+
+@dataclass
 class UserRecord:
     username: str
     display_name: str = ""

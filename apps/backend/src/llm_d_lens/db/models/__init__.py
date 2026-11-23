@@ -37,6 +37,7 @@ from llm_d_lens.db.models import (  # noqa: F401
 from llm_d_lens.db.models import (  # noqa: F401
     monitoring_cluster_stack_operation as monitoring_cluster_stack_operation,
 )
+from llm_d_lens.db.models import personal_access_token as personal_access_token  # noqa: F401
 from llm_d_lens.db.models import public_benchmark_record as public_benchmark_record  # noqa: F401
 from llm_d_lens.db.models import role as role  # noqa: F401
 from llm_d_lens.db.models import session as session  # noqa: F401
