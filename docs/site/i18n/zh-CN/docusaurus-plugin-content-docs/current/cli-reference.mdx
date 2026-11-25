@@ -83,7 +83,7 @@ TARGET_NODE=node-a KUBECONFIG="$HOME/.kube/config" hack/lens-local.sh check
 根据当前 REST schema 校验 Python MCP 目录，遇到非预期跳过的操作时失败。
 `--check` 执行相同校验，`--json` 导出目录，不再生成 Node 服务端文件。
 本地 `start`/`restart` 和安装后的启动器直接校验同一目录。
-纯 Python 等价命令为 `.venv/bin/python -m llm_d_lens.mcp.catalog`。
+纯 Python 等价命令为 `.venv/bin/python -m llm_d_lens.assistant_tools.catalog`。
 
 ## `alembic`
 

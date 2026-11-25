@@ -163,7 +163,7 @@ class AgenticMcpClient:
     """Read bounded cluster and AIC context from Prism's existing MCP endpoint."""
 
     def __init__(self, url: str | None = None, *, principal_id: str | None = None) -> None:
-        self.url = url or os.getenv("PRISM_MCP_URL", "http://127.0.0.1:3000/api/mcp")
+        self.url = url or os.getenv("PRISM_MCP_URL", "http://127.0.0.1:3000/api/assistant/mcp")
         self.principal_id = principal_id
 
     def _headers(self) -> dict[str, str]:

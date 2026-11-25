@@ -1172,7 +1172,7 @@ print_initial_admin_credentials() {
 regenerate_mcp_tools() {
     mkdir -p "$LOG_DIR"
     log "validating MCP tool catalog from the backend API..."
-    if ! .venv/bin/python -c 'from llm_d_lens.api.main import app; from llm_d_lens.mcp.catalog import catalog; print(f"Validated {len(catalog(app))} MCP tools")' >"$LOG_DIR/generate-mcp-tools.log" 2>&1; then
+    if ! .venv/bin/python -c 'from llm_d_lens.api.main import app; from llm_d_lens.assistant_tools.catalog import catalog; print(f"Validated {len(catalog(app))} MCP tools")' >"$LOG_DIR/generate-mcp-tools.log" 2>&1; then
         fail "MCP tool catalog validation failed; see $LOG_DIR/generate-mcp-tools.log"
         return 1
     fi
@@ -1201,7 +1201,7 @@ cmd_start() {
     local scheme="http"
     [[ "$ENABLE_HTTPS" == "1" ]] && scheme="https"
     start_one app env NODE_ENV=production BACKEND_HOST="$APP_HOST" BACKEND_PORT="$APP_PORT" \
-        PRISM_MCP_URL="$scheme://127.0.0.1:$APP_PORT/api/mcp" \
+        PRISM_MCP_URL="$scheme://127.0.0.1:$APP_PORT/api/assistant/mcp" \
         PRISM_MCP_CA_FILE="${TLS_CERT_FILE:-}" \
         LENS_MODEL_GATEWAY_AUTHZ_TLS_INSECURE="$authz_tls_insecure" \
         TLS_CERT_FILE="$TLS_CERT_FILE" TLS_KEY_FILE="$TLS_KEY_FILE" \

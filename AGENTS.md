@@ -85,9 +85,9 @@ A FastAPI route intended for Lens Assistant or MCP must declare an explicit
 backend routes, run `node hack/generate-mcp-tools.mjs --check`; it validates
 the Python catalog and fails on any unexpected skipped operation. Add UI-only,
 internal, streaming, secret-bearing or otherwise unsuitable routes to
-`intentionalSkips` in `apps/backend/src/llm_d_lens/mcp/definitions.json`.
-The catalog implementation is `llm_d_lens.mcp.catalog`; special handlers are in
-`llm_d_lens.mcp.tools`. No generated Node server artifact is required.
+`intentionalSkips` in `apps/backend/src/llm_d_lens/assistant_tools/definitions.json`.
+The catalog implementation is `llm_d_lens.assistant_tools.catalog`; special handlers are in
+`llm_d_lens.assistant_tools.tools`. No generated Node server artifact is required.
 
 ## Keep the docs site in sync
 

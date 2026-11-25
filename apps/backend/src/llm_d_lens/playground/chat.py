@@ -17,8 +17,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from llm_d_lens.ai_providers.service import default_service as default_ai_provider_service
-from llm_d_lens.mcp.catalog import catalog
-from llm_d_lens.mcp.tools import api_request, invoke_tool
+from llm_d_lens.assistant_tools.catalog import catalog
+from llm_d_lens.assistant_tools.tools import api_request, invoke_tool
 
 MAX_TOOL_CALL_TURNS = 40
 MCP_TOOL_CALL_TIMEOUT = 630

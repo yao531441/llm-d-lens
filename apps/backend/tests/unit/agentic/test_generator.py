@@ -261,7 +261,7 @@ def test_mcp_client_signs_authenticated_principal(monkeypatch):
     monkeypatch.setenv("LENS_INTERNAL_AUTH_SECRET", "test-secret")
     monkeypatch.setattr("llm_d_lens.agentic.generator.time.time", lambda: 1000)
 
-    headers = AgenticMcpClient("https://127.0.0.1:3005/api/mcp", principal_id="user-1")._headers()
+    headers = AgenticMcpClient("https://127.0.0.1:3005/api/assistant/mcp", principal_id="user-1")._headers()
 
     assert headers["x-prism-principal-id"] == "user-1"
     assert verify_internal(
@@ -269,7 +269,7 @@ def test_mcp_client_signs_authenticated_principal(monkeypatch):
         signature=headers["x-prism-internal-sig"],
         timestamp=1000,
         method="POST",
-        path="/api/mcp",
+        path="/api/assistant/mcp",
         principal_id="user-1",
         now=1000,
     )

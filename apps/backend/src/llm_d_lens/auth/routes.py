@@ -45,10 +45,10 @@ def _regex_for(path_template: str) -> re.Pattern[str]:
 
 ROUTE_PERMISSIONS: tuple[RoutePermission, ...] = (
     RoutePermission("GET", "/api/config", PUBLIC),
-    RoutePermission("POST", "/api/mcp", ("mcp:tool:invoke", "playground:chat:use")),
+    RoutePermission("POST", "/api/assistant/mcp", ("mcp:tool:invoke", "playground:chat:use")),
     RoutePermission("POST", "/api/playground/chat", "playground:chat:use"),
-    RoutePermission("GET", "/api/mcp", ("mcp:tool:invoke", "playground:chat:use")),
-    RoutePermission("DELETE", "/api/mcp", ("mcp:tool:invoke", "playground:chat:use")),
+    RoutePermission("GET", "/api/assistant/mcp", ("mcp:tool:invoke", "playground:chat:use")),
+    RoutePermission("DELETE", "/api/assistant/mcp", ("mcp:tool:invoke", "playground:chat:use")),
     # --- public ---
     RoutePermission("GET", "/api/health", PUBLIC),
     RoutePermission("GET", "/healthz", PUBLIC),
@@ -461,9 +461,9 @@ _NON_SCHEMA_ROUTES: tuple[tuple[str, str], ...] = (
     ("GET", "/api/simulation/openapi.json"),
     ("GET", "/docs/oauth2-redirect"),
     ("GET", "/api/config"),
-    ("GET", "/api/mcp"),
-    ("POST", "/api/mcp"),
-    ("DELETE", "/api/mcp"),
+    ("GET", "/api/assistant/mcp"),
+    ("POST", "/api/assistant/mcp"),
+    ("DELETE", "/api/assistant/mcp"),
     ("POST", "/api/playground/chat"),
     ("POST", "/api/configurations/resolve"),
     ("POST", "/api/configurations/render"),

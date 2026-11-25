@@ -8,7 +8,7 @@ import TabItem from '@theme/TabItem';
 
 ## 后端 API
 
-Lens Assistant 使用统一 Python 服务中的 `llm_d_lens.mcp.router`。其 FastAPI 路由通过官方 MCP Python SDK 在 `/api/mcp` 提供无状态 Streamable HTTP 端点。
+Lens Assistant 使用统一 Python 服务中的 `llm_d_lens.assistant_tools.router`。其 FastAPI 路由通过官方 MCP Python SDK 在 `/api/assistant/mcp` 提供无状态 Streamable HTTP 端点。
 
 候选工具声明并转发 `workload.concurrency` 或 `workload.request_rate`
 （正数且互斥的负载目标）。兼容 API 的输入／输出 token 长度缺省为
@@ -23,7 +23,7 @@ Lens Assistant 使用统一 Python 服务中的 `llm_d_lens.mcp.router`。其 Fa
 <Tabs>
   <TabItem value="rest-api" label="REST API">
 
-**`POST /api/mcp`**
+**`POST /api/assistant/mcp`**
 
 请求：
 
@@ -80,7 +80,7 @@ Lens Assistant 使用统一 Python 服务中的 `llm_d_lens.mcp.router`。其 Fa
   </TabItem>
   <TabItem value="python-api" label="Python API">
 
-使用官方 MCP Python 客户端进行传输调用。查询元数据时，`llm_d_lens.mcp.catalog.catalog(app)` 返回与端点相同的工具定义。进程内领域集成可复用[部署](/api-reference/modules/deployments)页面上的辅助函数：
+使用官方 MCP Python 客户端进行传输调用。查询元数据时，`llm_d_lens.assistant_tools.catalog.catalog(app)` 返回与端点相同的工具定义。进程内领域集成可复用[部署](/api-reference/modules/deployments)页面上的辅助函数：
 
 ```python
 from llm_d_lens.deploy.standard_kubernetes_service import (
@@ -109,7 +109,7 @@ print(configuration.checksum)
 <Tabs>
   <TabItem value="rest-api" label="REST API">
 
-**`GET /api/mcp`**
+**`GET /api/assistant/mcp`**
 
 请求：
 
@@ -145,7 +145,7 @@ Python 路由在无状态模式下拒绝 GET 流。请使用 MCP 客户端的 PO
 <Tabs>
   <TabItem value="rest-api" label="REST API">
 
-**`DELETE /api/mcp`**
+**`DELETE /api/assistant/mcp`**
 
 请求：
 
@@ -174,7 +174,7 @@ Python 路由不保留传输会话，因此拒绝终止会话的请求。使用 
   </TabItem>
 </Tabs>
 
-`llm_d_lens.mcp.catalog` 根据 FastAPI OpenAPI schema 生成工具，并与 `llm_d_lens/mcp/definitions.json` 中的 25 个特殊工具定义合并。`node hack/generate-mcp-tools.mjs --check` 校验该目录，不再生成 Node 文件。`llm_d_lens.mcp.tools` 通过进程内 ASGI 客户端调用规范 REST 路由，保留认证、CSRF 和资源范围检查。
+`llm_d_lens.assistant_tools.catalog` 根据 FastAPI OpenAPI schema 生成工具，并与 `llm_d_lens/assistant_tools/definitions.json` 中的 25 个特殊工具定义合并。`node hack/generate-mcp-tools.mjs --check` 校验该目录，不再生成 Node 文件。`llm_d_lens.assistant_tools.tools` 通过进程内 ASGI 客户端调用规范 REST 路由，保留认证、CSRF 和资源范围检查。
 
 ## MCP 工具调用的内容 {/* #what-the-mcp-tools-call */}
 
@@ -188,7 +188,7 @@ Python 路由不保留传输会话，因此拒绝终止会话的请求。使用 
 | `get_cluster_stack_status` | `GET /api/v1/monitoring/cluster-stack/status` | [可观测性](/api-reference/modules/observability)，经由 `llm_d_lens/monitoring/cluster_stack/router.py` |
 | `list_simulation_tasks` | `GET /api/simulation/tasks` | [模拟](/api-reference/modules/simulation)，经由 `llm_d_lens/simulation/router.py` |
 
-如果你需要的是 Python 而不是 MCP 传输，请直接调用其背后的 Python 领域逻辑，而不是通过 `/api/mcp`。例如，MCP 工具 `create_standard_vllm_deployment_run` 最终调用的是与 `POST /api/v1/deployments/standard-vllm-runs` 相同的部署辅助函数：
+如果你需要的是 Python 而不是 MCP 传输，请直接调用其背后的 Python 领域逻辑，而不是通过 `/api/assistant/mcp`。例如，MCP 工具 `create_standard_vllm_deployment_run` 最终调用的是与 `POST /api/v1/deployments/standard-vllm-runs` 相同的部署辅助函数：
 
 ```python
 from llm_d_lens.deploy.standard_kubernetes_service import (

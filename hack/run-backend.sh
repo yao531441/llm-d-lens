@@ -26,7 +26,7 @@ if [[ -n "${TLS_CERT_FILE:-}" && -n "${TLS_KEY_FILE:-}" ]]; then
     TLS_ARGS+=(--ssl-ca-certs "$TLS_CA_FILE")
   fi
 fi
-export PRISM_MCP_URL="${PRISM_MCP_URL:-$SCHEME://127.0.0.1:$BACKEND_PORT/api/mcp}"
+export PRISM_MCP_URL="${PRISM_MCP_URL:-$SCHEME://127.0.0.1:$BACKEND_PORT/api/assistant/mcp}"
 exec "$PYTHON" -m uvicorn llm_d_lens.api:app \
   --host "${BACKEND_HOST:-${SERVER_HOST:-${HOST:-0.0.0.0}}}" \
   --port "$BACKEND_PORT" ${TLS_ARGS[@]+"${TLS_ARGS[@]}"}
