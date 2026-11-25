@@ -4,70 +4,184 @@ description: Connect an MCP client (MCP Inspector, an IDE agent, or your own too
 ---
 
 Lens exposes its platform capabilities as a **Model Context Protocol (MCP)** server,
-so an MCP-capable client can inspect and operate Lens the same way the built-in
-[Lens Assistant](/user-guide/lens-assistant) does. The MCP layer is a **thin adapter**:
+so an MCP-capable client can plan, deploy and benchmark llm-d on Lens. The MCP layer is a **thin adapter**:
 every tool calls Lens' own REST API through an in-process ASGI client; no cluster, auth or domain logic is
-re-implemented in the MCP server.
+re-implemented in the MCP server. The built-in [Lens Assistant](/user-guide/lens-assistant) uses a
+separate, generated tool catalog at `/api/assistant/mcp`; it is an internal endpoint and is not described here.
 
 ## Endpoint and transport
 
 | Property | Value |
 | --- | --- |
-| Method / path | `POST /api/assistant/mcp` (on the unified Python service) |
+| Method / path | `POST /api/mcp`, on the unified Python service |
 | Default port | `BACKEND_PORT`, falling back to `SERVER_PORT` / `PORT` (3000; the local launcher selects a free port) |
 | Transport | MCP **Streamable HTTP**, JSON-RPC 2.0 |
 | Session | **Stateless** — one ephemeral MCP server per request, no `Mcp-Session-Id` |
-| Other methods | `GET` / `DELETE /api/assistant/mcp` return `405` (no server→client stream in stateless mode) |
+| Other methods | `GET` / `DELETE /api/mcp` return `405` (no server→client stream in stateless mode) |
 
 The endpoint is stateless on purpose: it scales horizontally and every tool re-reads
 **live** data from the REST API, so responses always reflect the current state.
 
 ## Authentication
 
-`POST /api/assistant/mcp` requires a **signed-in session** that holds one of these permissions:
+`POST /api/mcp` accepts a **personal access token** or signed-in session whose user holds one of these permissions:
 
 - `mcp:tool:invoke`, or
 - `playground:chat:use`
 
-Send the session either as the browser cookie **`prism_session`** or as a bearer token:
+Create a token under **Account → Personal access tokens**, name it, select a lifetime
+of 1–365 days (default 30), and copy its one-time plaintext. Send it as a bearer token:
 
 ```
-Authorization: Bearer <session-token>
+Authorization: Bearer <personal-access-token>
 ```
 
-`<session-token>` is the value of the `prism_session` cookie issued at login (read it from
-your browser's devtools while signed in). The Python authentication service validates
-the session; unauthenticated calls get `401 unauthenticated`, and a session
-without the permission above gets `403`.
+Tokens inherit the user's current roles and resource scope. The same Account dialog
+lists expiry and last use, and lets you revoke individual tokens. Password changes,
+password resets and account disabling invalidate tokens. New browser logins and logout
+do not revoke them. Invalid credentials get `401 unauthenticated`; missing permissions get `403`.
+Browser sessions still use `prism_session` plus CSRF; session Bearer credentials remain supported.
 
 :::note
-A dedicated credential for **third-party** MCP clients (API key / OAuth scope) is a
-planned, separate design — today external clients reuse a signed-in session. See
-`docs/design/mcp-playground-design.md` (Phase 4) for the open questions.
+PATs cannot manage credentials or issue other tokens. Use a normal login session for
+credential management. These `lens-pat-*` tokens are separate from inference keys
+(`lens-mk-*`). OAuth scopes and service accounts are not part of this feature.
 :::
 
-## Tools
+## Task tools
 
-The catalog is generated from Lens' REST surface and grouped by domain. Each tool carries a
-**risk tier**:
+The MCP server is task-oriented and runs inside the Lens process. It is built around the
+workflow of planning, deploying and benchmarking llm-d, instead of mirroring REST operations. It calls
+Lens REST in process with **your own credentials**, so it sees and may change exactly what you can in
+the Web UI. Lens keeps all state: the MCP server has no database, queue, lease or token of its own.
+Ids are Lens ids (a deployment is its Lens run id), so a resource created in the Web UI or by an agent
+can be read and used through either.
 
-| Tier | Meaning | Examples |
-| --- | --- | --- |
-| `read` | Read-only inspection | `list_clusters`, `list_deployments`, `get_deployment_pod_logs`, `get_flow_map_metrics`, `list_storage_volumes`, `search_huggingface_models` |
-| `write` | Changes state (create / start / stop / install) | `create_simulation_task`, `start_cluster_bootstrap`, `create_standard_vllm_deployment_run`, `install_gpu_driver`, `create_ai_provider` |
-| `approve` | Destructive; needs explicit confirmation | `delete_cluster`, `delete_configuration_artifact`, `delete_deployment_execution`, `delete_evaluation_workflow`, `delete_ai_provider` |
+Tools are grouped in profiles, set with `LENS_MCP_PROFILES` (comma separated, default `core`).
+A profile only limits what the server offers; Lens permissions are checked again on every call.
 
-Discover the exact, current list at runtime with `tools/list` (names change as modules
-evolve). All tools return JSON; a failing call comes back as an MCP error result
-(`isError: true`) whose message is the underlying REST error.
+| Profile | Tools |
+| --- | --- |
+| `core` | `cluster_list`, `cluster_get`, `placement_probe`, `guide_list`, `model_search`, `model_get`, `model_cache_create`, `deployment_plan`, `deployment_create`, `deployment_get`, `deployment_diagnose`, `deployment_test`, `deployment_logs`, `deployment_stop`, `experiment_plan`, `experiment_start`, `experiment_get`, `experiment_artifact_get`, `experiment_confirm`, `experiment_cancel`, `experiment_retry`, `result_compare`, `resource_list`, `resource_delete` |
+| `serving` | `model_service_publish`, `model_service_get`, `model_service_test`, `model_service_update`, `model_service_access_grant`, `model_service_access_revoke` |
+| `storage` | `storage_volume_create`, `storage_volume_get`, `storage_volume_scan` |
+| `simulation` | `trace_dataset_list`, `trace_dataset_prepare`, `simulation_start`, `simulation_get`, `simulation_cancel` |
+| `lens-settings` | `ai_provider_list`, `ai_provider_test` |
+| `cluster-admin` | `cluster_component_check`, `cluster_component_install`, `image_prepull`, `model_gateway_configure`, `model_gateway_reconcile`, `orphan_resource_list`, `orphan_resource_delete` |
+
+`cluster-admin` changes shared infrastructure and should stay off unless an operator needs it.
+
+Capacity and placement come from Lens. `cluster_get(include=["topology"])` shows the PCIe roots of each
+node and which are entirely free. `placement_probe` takes the roles of a topology (for example prefill
+and decode, with `replicas` and `tensorParallelSize`) and reports whether they fit now, on which nodes,
+or why not. The result is advisory because capacity can change before the deployment starts.
+
+`resource_list(kinds=["deployment"], owner="me")` includes deployments created in the Web UI when Lens
+identifies you as the owner. Reads expose `run_id`, `case_id`, `execution_id`, relative ownership and
+Lens-calculated `capabilities`; control follows those capabilities. The MCP server only changes resources
+you own. `resource_delete` takes `items: [{"kind":"deployment","id":"...","name":"..."}]`, and every
+`name` must match the id, otherwise nothing in the batch is deleted. Storage volumes are always deleted
+with their model files kept.
+
+Lens checks registered consumers before stop, clean and deletion. Active evaluations and published
+model-service members block these operations; unpublish members before teardown. Usage-probe failures
+also block cleanup. These checks are state-based and do not provide an atomic reservation against a
+concurrently starting consumer.
+
+### Persisted deployment verification
+
+`deployment_test` starts a Lens-owned check and returns `verification_id`, task `status`
+and, when finished, a separate `verdict` and per-check evidence. Use `wait_seconds`
+(0–25, default 25) to bound waiting. If still queued/running, pass the same
+`deployment_id` and `verification_id` to read it without sending more requests.
+Use `deployment_get(include=["verifications"])` to discover the saved history,
+including when the response to a creation request was lost. New checks support
+only `chat` and `prefix_cache`; older records remain readable.
+Web **Deployment Management → deployment details → Deployment verification** starts
+the same checks and automatically refreshes the same saved history.
+
+```json
+{"deployment_id":"execution-example","checks":["chat","prefix_cache"],"requests":10,"wait_seconds":0}
+```
+
+`requests` is the total limit (1–20), including six sequential repeated-prefix
+requests when checking prefix cache (minimum total 10). Each request asks for at most
+16 output tokens. Results retain attempted/HTTP-completed/successful counts and
+reported output tokens; these counts do not guarantee a server honored token limits.
+Checks run on the Lens host with no overall time limit; each request times out after
+10 seconds. Requests are never automatically replayed; tasks left unfinished by a
+backend restart are marked failed at the next startup. Reads never change lifecycle.
+
+Task `succeeded` means checking completed, not that every check passed. Chat verifies
+completion availability only. Positive response cached-token counts can establish
+prefix-cache use; zero/missing counts remain inconclusive. An observed HTTP or completion
+failure makes chat fail even when other requests have transport errors. KV-transfer,
+routing and rank verification are unsupported without request-attributed counters.
+No model response text is retained. Active verifications block teardown admission;
+this guard is not an atomic reservation against concurrent teardown. The latest 20 records live in
+execution diagnostics, survive stop/clean, and are removed with execution history.
+This uses existing storage without a table migration. Creating requires scoped
+`deployment:execution:connect`; reading requires scoped `deployment:run:read`.
+
+Task tools expose native Lens `BenchmarkScenario`, `BenchmarkSpec`,
+SLA targets and baseline parameters in the `experiment_plan` / `experiment_start`
+input schemas. Use `tools/list` to inspect nested workload fields and bounds instead
+of guessing keys. Scenario and baseline validation runs before planning or saving
+configuration artifacts. Lens validates the request again against its own version.
+
+For experiment guide fields, `modelPath` is an absolute worker-node path and implies
+`modelSource: "shared-path"` when the source is omitted. The rendered configuration
+retains it as `runtime.mountPath`, so Lens can verify the manifest's storage backing.
+`runtimeImage` is passed to guide planning as well as rendering.
+
+`deployment_plan` and `deployment_create` take `configuration` with the same guide fields as experiment
+`common` and `variants[].plan`, or `from_deployment_id` to clone a visible deployment with its exact Lens
+configuration and storage binding. Give exactly one of them. `cluster_id` is supplied outside the
+configuration; `deployment_name`, `description` and `model_cache_volume_id` are optional deployment
+context. `deployment_plan` validates and renders without creating anything and returns a `digest`;
+pass it to `deployment_create` as `expected_digest` and creation fails with `plan_stale` if the plan
+changed in between. Deployment reads include `configuration`.
+
+Prefill/decode (`DisaggregatedSet`) deployments run only from a plan the user has reviewed, as in the Web
+UI. For them `deployment_plan` freezes a Lens plan and returns `review` (`plan_id`, `plan_digest`, preflight
+errors, warnings and unknown constraints, workloads) and the generated `deployment_name`; pass `plan_id`,
+`plan_digest` and that `deployment_name` to `deployment_create`, plus `acknowledge_unknown` if the user
+accepts the constraints preflight could not check. An experiment with such deployments is returned by
+`experiment_start` as `awaiting_review` and starts only after `experiment_confirm`; retrying one goes back to review. In both cases ask the
+user to review the plan in the conversation or in the Lens Web UI (Evaluation, the experiment, Review
+deployment plans).
+
+```json
+{"cluster_id":"cluster-example","configuration":{"guide":"optimized-baseline","model":"Qwen/Qwen3-0.6B","tensorParallelSize":1,"maxNumSeqs":64}}
+```
+
+Shared guide fields support `source` and `customPatches` in both deployment and
+experiment inputs:
+
+- `source: {"mode":"official"}` (default) uses the cluster's pinned llm-d source and catalog.
+- `source: {"mode":"local","path":"/allowed/guides/kustomization.yaml"}` reads a
+  path on the **Lens host**, subject to `PRISM_GUIDE_LOCAL_ROOTS`. Optional `ref` is a
+  source label; it does not pin working-tree content.
+- `source: {"mode":"remote","repository":"owner/repo","path":"guides/model.yaml","ref":"main"}`
+  lets Lens resolve a GitHub ref to a commit. Local and remote sources bypass the
+  pinned official catalog's membership checks; Lens still validates the selected manifest.
+- `customPatches` accepts at most 20 objects with `path` (display label) and `content`
+  (resource YAML, at most 262144 UTF-8 bytes per file). Lens matches documents by
+  `kind` and optional `metadata.name`, merges name-keyed arrays, and appends unmatched
+  resources with a warning. Ambiguous matches are errors. These patches are distinct
+  from the RFC 7396 clone patches; they are neither JSON Patch nor generic merge-patch requests.
+
+Plans report the resolved `source` and `applied_custom_patches`; rendered manifests
+and source provenance are retained in Lens configurations. For a local working tree,
+the returned commit or fallback hash alone does not prove that all content is pinned.
 
 ## Connect a client
 
 ### MCP Inspector
 
 1. Start the Lens dev stack (`hack/lens-local.sh start`).
-2. In MCP Inspector choose **Streamable HTTP**, URL `http://<lens-host>:3000/api/assistant/mcp`.
-3. Add header `Authorization: Bearer <session-token>`, then **Connect** and list tools.
+2. In MCP Inspector choose **Streamable HTTP**, URL `http://<lens-host>:3000/api/mcp`.
+3. Add header `Authorization: Bearer <personal-access-token>`, then **Connect** and list tools.
 
 ### Generic MCP client config
 
@@ -76,9 +190,9 @@ evolve). All tools return JSON; a failing call comes back as an MCP error result
   "mcpServers": {
     "lens": {
       "type": "http",
-      "url": "http://<lens-host>:3000/api/assistant/mcp",
+      "url": "http://<lens-host>:3000/api/mcp",
       "headers": {
-        "Authorization": "Bearer <session-token>"
+        "Authorization": "Bearer <personal-access-token>"
       }
     }
   }
@@ -88,8 +202,8 @@ evolve). All tools return JSON; a failing call comes back as an MCP error result
 ### Raw JSON-RPC
 
 ```bash
-BASE=http://<lens-host>:3000/api/assistant/mcp
-H="Authorization: Bearer <session-token>"
+BASE=http://<lens-host>:3000/api/mcp
+H="Authorization: Bearer <personal-access-token>"
 
 # 1) handshake
 curl -s "$BASE" -H "$H" -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d '{
@@ -103,14 +217,16 @@ curl -s "$BASE" -H "$H" -H 'content-type: application/json' -H 'accept: applicat
 # 3) call a read tool
 curl -s "$BASE" -H "$H" -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d '{
   "jsonrpc":"2.0","id":3,"method":"tools/call",
-  "params":{"name":"list_clusters","arguments":{}}}'
+  "params":{"name":"cluster_list","arguments":{}}}'
 ```
 
 ## Notes
 
-- Tools are read/write/approve; the `approve` tier should only be invoked behind a human
-  confirmation step (as the Lens Assistant UI does) — an agent must not auto-approve.
-- The MCP server never talks to clusters directly: it calls Lens REST, which applies the
-  same authentication, RBAC and scoping rules as the UI.
-- Because the transport is stateless, a new `initialize` is not required per call, but every
-  request must still carry the credentials above.
+- Destructive tools (`deployment_stop`, `experiment_cancel`, `resource_delete` and every `cluster-admin` tool) carry
+  `destructiveHint`; a host should ask for human confirmation before calling them.
+- Task tools return failures as MCP error results (`isError: true`) with a stable `code`, the offending `field` and a
+  `hint` naming the next tool.
+- The MCP server never talks to clusters directly: it calls Lens REST, which applies the same authentication, RBAC
+  and scoping rules as the UI.
+- Because the transport is stateless, a new `initialize` is not required per call, but every request must still
+  carry the credentials above.
