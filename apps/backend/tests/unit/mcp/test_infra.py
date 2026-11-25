@@ -81,6 +81,12 @@ async def test_in_use_resources_are_blocked_and_unexpected_timeouts_are_reported
 
 
 @pytest.mark.asyncio
+async def test_tools_outside_the_connection_profiles_are_refused(ctx):
+    payload, is_error = await call_tool(ctx, "orphan_resource_list", {"cluster_id": "b9d6d401"})
+    assert is_error and payload["error"]["code"] == "scope_required"
+
+
+@pytest.mark.asyncio
 async def test_secrets_are_rejected_in_input_and_redacted_in_output(ctx, fake_kind):
     token = "hf_" + "a" * 30
     payload, is_error = await call_tool(ctx, "resource_delete", {"items": [item("a", token)]})
