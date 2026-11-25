@@ -94,6 +94,8 @@ def phase_of(workflow: dict[str, Any], case: dict[str, Any] | None) -> str:
         return "terminal"
     if status == "cancelling":
         return "cancelling"
+    if status == "awaiting_review":
+        return "awaiting_review"
     if case and case.get("status") in ("deploying", "benchmarking"):
         return case["status"]
     return "queued"
@@ -167,6 +169,8 @@ def stale_check(
 
 def poll_after(phase: str, remaining_seconds: int | None) -> int | None:
     if phase == "terminal":
+        return None
+    if phase == "awaiting_review":
         return None
     if phase == "cancelling":
         return 15

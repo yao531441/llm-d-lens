@@ -71,6 +71,8 @@ def test_annotations_follow_the_delta_table():
     cancel = tools["experiment_cancel"]
     assert cancel.destructive and cancel.idempotent and not cancel.read_only
     assert not tools["experiment_retry"].read_only and not tools["experiment_retry"].destructive
+    confirm = tools["experiment_confirm"]
+    assert not confirm.read_only and not confirm.destructive and confirm.profile == "core"
 
 
 SCENARIO = {"id": "chat", "name": "Chat", "benchmark": {"matrix": [{"isl": 512, "osl": 128}]}}
@@ -705,6 +707,140 @@ async def test_failed_create_removes_the_artifacts_it_saved(api, ctx, lens):
     assert sorted(deleted) == sorted(f"/configurations/artifacts/{uuid(n)}" for n in (1, 2))
 
 
+PD_PLANS = [
+    {
+        "case_id": "guide-1-1",
+        "id": "plan-1",
+        "digest": "sha256:abc",
+        "preflight": {"status": "unknown", "errors": [], "warnings": [], "unmodeled": ["DRA"]},
+        "cases": [{"namespace": "pd-ns", "manifestChecksum": "m1"}],
+    }
+]
+
+
+def awaiting_review(lens: Evaluations, owner: str = "user-a") -> str:
+    workflow = lens.add(
+        {
+            "id": uuid(8000 + len(lens.workflows)),
+            "name": "pd",
+            "status": "awaiting_review",
+            "cluster_id": "c1",
+            "owner_user_id": owner,
+            "created_at": "2026-05-01T10:00:00+00:00",
+            "prepared_plans": PD_PLANS,
+            "cases": [{"id": "guide-1-1", "kind": "guide", "status": "queued", "benchmark": {"matrix": []}}],
+        }
+    )
+    lens.api.on(
+        "POST",
+        f"/evaluate/evaluations/{workflow['id']}/confirm",
+        lambda params, body: {"id": workflow["id"], "status": "queued"},
+    )
+    return workflow["id"]
+
+
+@pytest.mark.asyncio
+async def test_plan_tells_the_agent_that_a_prefill_decode_design_waits_for_review(api, ctx, lens):
+    plain, _ = await run(ctx, "experiment_plan", **DESIGN)
+    assert "awaiting_review" not in plain["next"]
+    catalog = api.routes[("GET", "/guide-planning/catalog")]
+    catalog["guides"].append({**catalog["guides"][0], "id": "pd-disaggregation"})
+    plan = load_plan()
+    plan["source"]["guide"] = "pd-disaggregation"
+    api.on("POST", "/guide-planning/plan", plan)
+    pd_design = {
+        **DESIGN,
+        "variants": [{"id": "pd"}],
+        "common": {
+            **COMMON,
+            "guide": "pd-disaggregation",
+            "prefillReplicas": 1,
+            "prefillTensorParallelSize": 1,
+            "decodeReplicas": 1,
+            "decodeTensorParallelSize": 1,
+        },
+    }
+    planned, is_error = await run(ctx, "experiment_plan", **pd_design)
+    assert not is_error, planned
+    assert "awaiting_review" in planned["next"] and "experiment_confirm" in planned["next"]
+
+
+@pytest.mark.asyncio
+async def test_start_reports_an_experiment_that_waits_for_plan_review(api, ctx, lens):
+    create = lens.create
+    api.on(
+        "POST",
+        "/evaluate/evaluations",
+        lambda params, body: {**create(params, body), "status": "awaiting_review", "prepared_plans": PD_PLANS},
+    )
+    started, is_error = await run(ctx, "experiment_start", **DESIGN)
+    assert not is_error, started
+    assert started["status"] == "awaiting_review" and "poll_after_seconds" not in started
+    (plan,) = started["review_required"]["plans"]
+    assert plan["plan_id"] == "plan-1" and plan["plan_digest"] == "sha256:abc" and plan["case_id"] == "guide-1-1"
+    assert plan["preflight"]["unknown_constraints"] == ["DRA"]
+    assert "experiment_confirm" in started["next"] and "review" in started["next"]
+
+
+@pytest.mark.asyncio
+async def test_get_shows_awaiting_review_as_its_own_phase_and_not_as_stale(api, ctx, lens, monkeypatch):
+    monkeypatch.setattr(evaluation_view, "now", lambda: evaluation_view.parse_time("2026-05-02T10:00:00+00:00"))
+    experiment_id = awaiting_review(lens)
+    view, is_error = await run(ctx, "experiment_get", experiment_id=experiment_id)
+    assert not is_error, view
+    assert view["status"] == "awaiting_review" and view["poll_after_seconds"] is None
+    assert view["stale"] == {"is_stale": False}
+    assert view["review_required"]["plans"][0]["plan_id"] == "plan-1"
+    assert "experiment_confirm" in view["review_required"]["next"]
+
+
+@pytest.mark.asyncio
+async def test_confirm_sends_the_reviewed_digests_and_queues_the_experiment(api, ctx, lens):
+    experiment_id = awaiting_review(lens)
+    done, is_error = await run(
+        ctx,
+        "experiment_confirm",
+        experiment_id=experiment_id,
+        plan_digests={"plan-1": "sha256:abc"},
+        acknowledge_unknown=True,
+    )
+    assert not is_error, done
+    assert done["status"] == "queued" and "experiment_get" in done["next"]
+    (body,) = api.called("POST", f"/evaluate/evaluations/{experiment_id}/confirm")
+    assert body == {"plan_digests": {"plan-1": "sha256:abc"}, "acknowledge_unknown": True}
+
+
+@pytest.mark.asyncio
+async def test_confirm_is_limited_to_the_creator_and_to_experiments_awaiting_review(api, ctx, lens):
+    theirs = awaiting_review(lens, owner="someone-else")
+    refused, is_error = await run(ctx, "experiment_confirm", experiment_id=theirs, plan_digests={"plan-1": "d"})
+    assert is_error and refused["error"]["code"] == "not_owner"
+    running = running_workflow(lens)
+    refused, is_error = await run(ctx, "experiment_confirm", experiment_id=running, plan_digests={"plan-1": "d"})
+    assert is_error and refused["error"]["code"] == "conflict_state"
+    assert api.called("POST", f"/evaluate/evaluations/{theirs}/confirm") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "code"),
+    [
+        ("Reviewed Evaluation plan digests do not match", "plan_stale"),
+        ("Prepared Evaluation plan is unavailable", "plan_stale"),
+        ("Preflight failed or unknown constraints were not acknowledged", "unknown_not_acknowledged"),
+    ],
+)
+async def test_confirm_refused_by_lens_tells_the_agent_what_to_do(api, ctx, lens, message, code):
+    experiment_id = awaiting_review(lens)
+    api.on(
+        "POST",
+        f"/evaluate/evaluations/{experiment_id}/confirm",
+        LensApiError(409, {"detail": message}, "POST", "x"),
+    )
+    refused, is_error = await run(ctx, "experiment_confirm", experiment_id=experiment_id, plan_digests={"plan-1": "d"})
+    assert is_error and refused["error"]["code"] == code
+
+
 def running_workflow(lens: Evaluations, owner: str = "user-a", heartbeat: str = "2026-05-01T10:10:00+00:00") -> str:
     workflow = lens.add(
         {
@@ -880,6 +1016,14 @@ async def test_cancel_is_limited_to_the_creator_and_reports_cleanup(api, ctx, le
 
 
 @pytest.mark.asyncio
+async def test_a_cancel_that_outlasts_the_request_timeout_is_a_retryable_cleanup(api, ctx, lens):
+    mine = running_workflow(lens)
+    api.on("POST", f"/evaluate/workflow-runs/{mine}/cancel", TimeoutError())
+    payload, is_error = await run(ctx, "experiment_cancel", experiment_id=mine)
+    assert is_error and payload["error"]["code"] == "cleanup_pending" and payload["error"]["retryable"]
+
+
+@pytest.mark.asyncio
 async def test_cancel_case_and_cleanup_failure(api, ctx, lens):
     mine = running_workflow(lens)
     unknown, is_error = await run(ctx, "experiment_cancel", experiment_id=mine, case_ids=["nope"])
@@ -908,6 +1052,23 @@ async def test_retry_only_failed_or_cancelled_experiments_of_the_creator(api, ct
     theirs = foreign(lens, status="failed")
     other, _ = await run(ctx, "experiment_retry", experiment_id=theirs)
     assert other["error"]["code"] == "not_owner"
+
+
+@pytest.mark.asyncio
+async def test_a_retry_that_needs_new_plans_comes_back_for_review(api, ctx, lens):
+    failed = running_workflow(lens)
+    lens.workflows[failed]["status"] = "failed"
+    lens.workflows[failed]["cases"][0]["status"] = "failed"
+    api.on(
+        "POST",
+        f"/evaluate/workflow-runs/{failed}/retry",
+        lambda *_: {**lens.workflows[failed], "status": "awaiting_review", "prepared_plans": PD_PLANS},
+    )
+    payload, is_error = await run(ctx, "experiment_retry", experiment_id=failed)
+    assert not is_error, payload
+    assert payload["status"] == "awaiting_review" and payload["requeued_case_ids"] == ["guide-1-1"]
+    assert "poll_after_seconds" not in payload
+    assert [plan["plan_id"] for plan in payload["review_required"]["plans"]] == [PD_PLANS[0]["id"]]
 
 
 @pytest.mark.asyncio

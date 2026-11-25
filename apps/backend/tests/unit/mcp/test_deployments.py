@@ -259,6 +259,155 @@ async def test_plan_unknown_cluster_points_at_cluster_list(api, ctx):
     assert "cluster_list" in error["hint"]
 
 
+# prefill/decode deployments need a reviewed plan ---------------------------------------------------------------
+
+PD_ARGS = {"cluster_id": "c1", "configuration": FIELDS, "deployment_name": "pd-demo", "description": "pd"}
+PD_PLAN = {
+    "id": "plan-1",
+    "digest": "sha256:abc",
+    "preflight": {"status": "unknown", "errors": [], "warnings": [{"message": "tight"}], "unmodeled": ["DRA"]},
+    "cases": [{"namespace": "pd-ns", "manifestChecksum": "m1", "manifest": "not for the agent"}],
+}
+
+
+PD_CONTENTS = [
+    {"disaggregatedSet": {"slices": 1}},
+    {"officialGuide": {"renderedManifest": "apiVersion: disaggregatedset.x-k8s.io/v1\nkind: DisaggregatedSet\n"}},
+]
+
+
+def pd_routes(api: FakeApi, plan=PD_PLAN, content=PD_CONTENTS[0]) -> None:
+    plan_routes(api)
+    api.on(
+        "POST",
+        "/configurations/render",
+        lambda params, body: {"deployable_configuration": {"type": "baseline", "content": content}},
+    )
+    api.on("POST", "/deployments/plans", plan)
+    api.on("POST", "/deployments/runs", {"id": "run-1"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", PD_CONTENTS)
+async def test_plan_of_a_disaggregated_set_freezes_a_lens_plan_and_returns_its_review(api, ctx, content):
+    pd_routes(api, content=content)
+    payload, is_error = await call_tool(ctx, "deployment_plan", PD_ARGS)
+    assert not is_error, payload
+    assert payload["review"] == {
+        "plan_id": "plan-1",
+        "plan_digest": "sha256:abc",
+        "preflight": {"status": "unknown", "errors": [], "warnings": ["tight"], "unknown_constraints": ["DRA"]},
+        "workloads": [{"namespace": "pd-ns", "manifest_checksum": "m1"}],
+    }
+    assert "plan_id" in payload["next"] and "pd-demo" in payload["next"] and "ask them" in payload["next"]
+    assert len(api.called("POST", "/deployments/plans")) == 1
+    assert api.called("POST", "/deployments/runs") == []
+
+
+@pytest.mark.asyncio
+async def test_plan_of_a_single_server_deployment_stores_nothing_in_lens(api, ctx):
+    plan_routes(api)
+    payload, _ = await call_tool(ctx, "deployment_plan", ARGS)
+    assert "review" not in payload
+    assert api.called("POST", "/deployments/plans") == []
+
+
+@pytest.mark.asyncio
+async def test_a_plan_whose_preflight_failed_is_invalid_and_not_creatable(api, ctx):
+    failed = {**PD_PLAN, "preflight": {"status": "fail", "errors": [{"message": "no free roots"}], "unmodeled": []}}
+    pd_routes(api, failed)
+    payload, is_error = await call_tool(ctx, "deployment_plan", PD_ARGS)
+    assert not is_error and payload["status"] == "invalid"
+    assert payload["validation"]["errors"] == ["no free roots"]
+
+
+@pytest.mark.asyncio
+async def test_create_of_a_disaggregated_set_without_a_reviewed_plan_is_refused(api, ctx):
+    pd_routes(api)
+    payload, is_error = await call_tool(ctx, "deployment_create", PD_ARGS)
+    assert is_error and payload["error"]["code"] == "plan_required"
+    assert "deployment_plan" in payload["error"]["hint"]
+    assert api.called("POST", "/deployments/runs") == []
+
+
+@pytest.mark.asyncio
+async def test_create_sends_the_reviewed_plan_with_the_request_it_was_frozen_from(api, ctx):
+    pd_routes(api)
+    await call_tool(ctx, "deployment_plan", PD_ARGS)
+    created, is_error = await call_tool(
+        ctx,
+        "deployment_create",
+        {**PD_ARGS, "plan_id": "plan-1", "plan_digest": "sha256:abc", "acknowledge_unknown": True},
+    )
+    assert not is_error, created
+    (frozen,) = api.called("POST", "/deployments/plans")
+    (body,) = api.called("POST", "/deployments/runs")
+    # Lens only executes a plan when the run request equals the one the plan was frozen from.
+    assert {key: value for key, value in body.items() if key in frozen} == frozen
+    assert body["prepared_plan_id"] == "plan-1"
+    assert body["expected_plan_digest"] == "sha256:abc"
+    assert body["acknowledge_unknown"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_generated_name_can_be_passed_back_to_create_with_the_plan_digest(api, ctx):
+    pd_routes(api)
+    args = {key: value for key, value in PD_ARGS.items() if key != "deployment_name"}
+    plan, is_error = await call_tool(ctx, "deployment_plan", args)
+    assert not is_error, plan
+    created, is_error = await call_tool(
+        ctx,
+        "deployment_create",
+        {
+            **args,
+            "deployment_name": plan["name"],
+            "expected_digest": plan["digest"],
+            "plan_id": plan["review"]["plan_id"],
+            "plan_digest": plan["review"]["plan_digest"],
+        },
+    )
+    assert not is_error, created
+
+
+@pytest.mark.asyncio
+async def test_a_reviewed_plan_is_bound_to_the_deployment_name(api, ctx):
+    pd_routes(api)
+    args = {key: value for key, value in PD_ARGS.items() if key != "deployment_name"}
+    payload, is_error = await call_tool(ctx, "deployment_create", {**args, "plan_id": "plan-1", "plan_digest": "d"})
+    assert is_error and payload["error"]["field"] == "deployment_name"
+    assert api.called("POST", "/deployments/runs") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "code"),
+    [
+        ("Reviewed deployment plan digest does not match", "plan_stale"),
+        ("Configuration, runtime binding or cluster changed; prepare a new plan", "plan_stale"),
+        (
+            "Deployment preflight failed or its unknown constraints have not been acknowledged",
+            "unknown_not_acknowledged",
+        ),
+        ("something else", "plan_rejected"),
+    ],
+)
+async def test_lens_refusing_a_reviewed_plan_tells_the_agent_what_to_do(api, ctx, message, code):
+    pd_routes(api)
+    api.on("POST", "/deployments/runs", LensApiError(409, {"detail": message}, "POST", "/deployments/runs"))
+    payload, is_error = await call_tool(
+        ctx, "deployment_create", {**PD_ARGS, "plan_id": "plan-1", "plan_digest": "sha256:abc"}
+    )
+    assert is_error and payload["error"]["code"] == code
+
+
+@pytest.mark.asyncio
+async def test_a_plan_id_is_refused_for_a_single_server_deployment(api, ctx):
+    plan_routes(api)
+    payload, is_error = await call_tool(ctx, "deployment_create", {**ARGS, "plan_id": "plan-1", "plan_digest": "d"})
+    assert is_error and payload["error"]["code"] == "invalid_argument"
+    assert api.called("POST", "/deployments/runs") == []
+
+
 # create --------------------------------------------------------------------------------------------------------
 
 
