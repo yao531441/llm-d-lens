@@ -6,7 +6,10 @@ import hashlib
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
+
+from llm_d_lens.deploy.prepared_plans import requires_prepared_plan
 
 from .cluster_info import cluster_summary
 from .context import ToolContext
@@ -33,6 +36,11 @@ class Prepared:
     applied_patches: list[dict[str, Any]] = field(default_factory=list)
     digest: str = ""
 
+    @property
+    def needs_review(self) -> bool:
+        """Lens deploys a DisaggregatedSet only from a reviewed plan."""
+        return requires_prepared_plan([SimpleNamespace(content=self.configuration.get("content") or {})])
+
 
 def _executable(configuration: dict[str, Any], source: dict[str, Any] | None, chosen: str) -> str:
     """The rendered configuration and guide source; the deployment name is masked so generated names agree."""
@@ -40,9 +48,13 @@ def _executable(configuration: dict[str, Any], source: dict[str, Any] | None, ch
     return canonical({"configuration": body, "source": source}).replace(chosen, "<name>")
 
 
-def _digest(cluster_id: str, name: str | None, resolved: dict[str, Any], executable: str | None = None) -> str:
-    """Over the request, what Lens resolved and the rendered configuration Lens would run."""
-    payload = {"cluster_id": cluster_id, "name": name, "resolved": resolved, "executable": executable}
+def _digest(cluster_id: str, resolved: dict[str, Any], executable: str | None = None) -> str:
+    """Over the request, what Lens resolved and the rendered configuration Lens would run.
+
+    The deployment name is not part of it: a plan made with a generated name must match the create that passes
+    that name back.
+    """
+    payload = {"cluster_id": cluster_id, "resolved": resolved, "executable": executable}
     return "sha256:" + hashlib.sha256(canonical(payload).encode()).hexdigest()[:32]
 
 
@@ -92,7 +104,7 @@ async def _from_configuration(
         warnings,
         planned.source,
         planned.applied_patches,
-        _digest(cluster_id, name, resolved, _executable(planned.configuration, planned.source, chosen)),
+        _digest(cluster_id, resolved, _executable(planned.configuration, planned.source, chosen)),
     )
 
 
@@ -128,7 +140,7 @@ async def _from_deployment(ctx: ToolContext, source_id: str, cluster_id: str | N
         resolved,
         None,
         None,
-        digest=_digest(cluster_id, name, resolved, _executable(configuration, None, chosen)),
+        digest=_digest(cluster_id, resolved, _executable(configuration, None, chosen)),
     )
 
 
@@ -164,19 +176,39 @@ async def prepare(
     return await _from_configuration(ctx, configuration, cluster_id, deployment_name, model_cache_volume_id)  # type: ignore[arg-type]
 
 
-async def launch(ctx: ToolContext, prepared: Prepared, description: str | None) -> dict[str, Any]:
-    """Create the Lens deployment run; its id is the deployment id."""
-    return await ctx.api.request(
-        "POST",
-        "/deployments/runs",
-        body={
-            "configurations": [prepared.configuration],
-            "provenance": {
-                "cluster_session_id": prepared.session_id,
-                "cluster_server_id": prepared.cluster_id,
-                "created_via": CREATED_VIA,
-                **({"description": description} if description is not None else {}),
-            },
+def _run_body(prepared: Prepared, description: str | None, **plan: Any) -> dict[str, Any]:
+    return {
+        "configurations": [prepared.configuration],
+        "provenance": {
+            "cluster_session_id": prepared.session_id,
+            "cluster_server_id": prepared.cluster_id,
+            "created_via": CREATED_VIA,
+            **({"description": description} if description is not None else {}),
         },
-        timeout=120,
+        **plan,
+    }
+
+
+async def freeze_plan(ctx: ToolContext, prepared: Prepared, description: str | None) -> dict[str, Any]:
+    """Have Lens freeze and preflight the deployment; stores a plan but creates no run and no cluster resource."""
+    return await ctx.api.request("POST", "/deployments/plans", body=_run_body(prepared, description), timeout=120)
+
+
+async def launch(
+    ctx: ToolContext,
+    prepared: Prepared,
+    description: str | None,
+    *,
+    plan_id: str | None = None,
+    plan_digest: str | None = None,
+    acknowledge_unknown: bool = False,
+) -> dict[str, Any]:
+    """Create the Lens deployment run; its id is the deployment id."""
+    plan = (
+        {"prepared_plan_id": plan_id, "expected_plan_digest": plan_digest, "acknowledge_unknown": acknowledge_unknown}
+        if plan_id
+        else {}
+    )
+    return await ctx.api.request(
+        "POST", "/deployments/runs", body=_run_body(prepared, description, **plan), timeout=120
     )
