@@ -7,13 +7,14 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..context import ToolContext
-from ..deploy_create import Prepared, launch, prepare
+from ..deploy_create import Prepared, freeze_plan, launch, prepare
 from ..deploy_kind import delete_deployment, get_deployment, list_deployments
 from ..deployment_refs import require_owned, resolve
 from ..errors import ToolError
 from ..guide_fields import GuidePlanFields
 from ..kinds import register_kind
 from ..lens_api import LensApiError
+from ..plan_review import DEPLOYMENT_REVIEW, plan_rejection, review_view
 from ..planning import NOT_CHECKED, invalid_plan, location_caveat
 from ..registry import tool
 
@@ -50,6 +51,20 @@ class PlanDeploymentArgs(BaseModel):
 class CreateDeploymentArgs(PlanDeploymentArgs):
     expected_digest: str | None = Field(
         default=None, description="digest from deployment_plan; create fails with plan_stale if the plan changed."
+    )
+    plan_id: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$",
+        description="review.plan_id from deployment_plan. Required for a prefill/decode (DisaggregatedSet) "
+        "deployment, which Lens only creates from a reviewed plan.",
+    )
+    plan_digest: str | None = Field(
+        default=None, description="review.plan_digest from deployment_plan, repeated to show it was reviewed."
+    )
+    acknowledge_unknown: bool = Field(
+        default=False,
+        description="Accept the scheduling constraints preflight could not check. Only after the user has seen "
+        "them in review.preflight.unknown_constraints.",
     )
 
 
@@ -95,9 +110,12 @@ async def _prepare(ctx: ToolContext, args: PlanDeploymentArgs) -> Prepared:
     "deployment_plan",
     "[R] Check a deployment against the cluster and the llm-d guide without creating anything. Returns the "
     "resolved configuration, the accelerators it needs, warnings and a digest to pass to deployment_create. "
-    "Validation problems come back as status 'invalid' with errors, not as tool errors. To see free accelerators "
-    "first use cluster_get.\n"
-    "Side effects: none; resources: none; duration: synchronous, up to a minute; reversible: n/a.",
+    "A prefill/decode (DisaggregatedSet) deployment is also frozen and preflighted by Lens and returns a review "
+    "(plan_id, plan_digest, preflight, workloads) that deployment_create needs; that stores a plan in Lens but "
+    "creates no run and no cluster resource. Validation problems come back as status 'invalid' with errors, not as "
+    "tool errors. To see free accelerators first use cluster_get.\n"
+    "Side effects: none for a single-server deployment, one stored Lens plan for a prefill/decode one; resources: "
+    "none; duration: synchronous, up to a minute; reversible: n/a.",
     PlanDeploymentArgs,
     read_only=True,
     open_world=True,
@@ -107,10 +125,26 @@ async def plan_deployment(ctx: ToolContext, args: PlanDeploymentArgs) -> dict[st
         prepared = await _prepare(ctx, args)
     except ToolError as error:
         return invalid_plan(error, "Fix the error and call deployment_plan again.")
-    next_step = location_caveat(
-        "Call deployment_create with the same input and expected_digest=digest.", [prepared.resolved]
-    )
-    return {**_describe(prepared), "next": next_step}
+    result = _describe(prepared)
+    next_step = "Call deployment_create with the same input and expected_digest=digest."
+    if prepared.needs_review:
+        try:
+            review = review_view(await freeze_plan(ctx, prepared, args.description))
+        except LensApiError as error:
+            if error.status != 422:
+                raise
+            return invalid_plan(ToolError("plan_invalid", error.message()), "Fix the error and plan again.")
+        result["review"] = review
+        if review["preflight"]["status"] == "fail":
+            result["status"] = "invalid"
+            result["validation"]["errors"] = review["preflight"]["errors"]
+            next_step = "Preflight failed on the cluster as it is now; fix that and call deployment_plan again."
+        else:
+            next_step = (
+                f"{DEPLOYMENT_REVIEW} Then call deployment_create with the same input, deployment_name="
+                f"'{prepared.name}', expected_digest=digest, plan_id and plan_digest from review."
+            )
+    return {**result, "next": location_caveat(next_step, [prepared.resolved])}
 
 
 @tool(
@@ -135,7 +169,39 @@ async def create_deployment(ctx: ToolContext, args: CreateDeploymentArgs) -> dic
             hint="Call deployment_plan again, review it, and create with its digest.",
             current_digest=prepared.digest,
         )
-    run = await launch(ctx, prepared, args.description)
+    reviewed = {}
+    if prepared.needs_review:
+        if not (args.plan_id and args.plan_digest):
+            raise ToolError(
+                "plan_required",
+                "A prefill/decode (DisaggregatedSet) deployment can only be created from a reviewed plan.",
+                field="plan_id",
+                hint="Call deployment_plan, show the user its review, then pass review.plan_id and "
+                "review.plan_digest together with the same deployment_name and description.",
+            )
+        if not args.deployment_name:
+            raise ToolError(
+                "invalid_argument",
+                "The reviewed plan is bound to its deployment name; repeat the deployment_name from deployment_plan.",
+                field="deployment_name",
+            )
+        reviewed = {
+            "plan_id": args.plan_id,
+            "plan_digest": args.plan_digest,
+            "acknowledge_unknown": args.acknowledge_unknown,
+        }
+    elif args.plan_id or args.plan_digest:
+        raise ToolError(
+            "invalid_argument",
+            "plan_id applies only to a prefill/decode (DisaggregatedSet) deployment.",
+            field="plan_id",
+        )
+    try:
+        run = await launch(ctx, prepared, args.description, **reviewed)
+    except LensApiError as error:
+        if not reviewed:
+            raise
+        raise plan_rejection(error) from error
     return {
         "deployment_id": run["id"],
         "name": prepared.name,
