@@ -12,6 +12,7 @@ from .evaluation_plan import MAX_LISTED_CASES, Prepared, eta, prepare
 from .kinds import owner_state
 from .lens_api import LensApiError
 from .path_ids import check_id
+from .plan_review import EXPERIMENT_REVIEW, plan_rejection, review_view
 from .planning import slug
 from .registry import upstream_error
 
@@ -58,15 +59,30 @@ def guard_owner(ctx: ToolContext, workflow: dict[str, Any]) -> None:
         )
 
 
+def review_required(workflow: dict[str, Any]) -> dict[str, Any]:
+    """The plans Lens froze for an experiment that waits for confirmation (prefill/decode deployments)."""
+    return {
+        "plans": [
+            {"case_id": item.get("case_id"), **review_view(item)} for item in workflow.get("prepared_plans") or []
+        ],
+        "next": EXPERIMENT_REVIEW,
+    }
+
+
 def _started(workflow: dict[str, Any], prepared: Prepared, artifact_ids: dict[str, str]) -> dict[str, Any]:
     cases = workflow.get("cases") or []
+    awaiting = workflow.get("status") == "awaiting_review"
     return {
         "experiment_id": workflow["id"],
         "status": workflow.get("status"),
         "cases_total": len(cases),
         "artifact_ids": artifact_ids,
-        "poll_after_seconds": 60,
-        "next": f"Call experiment_get(experiment_id='{workflow['id']}', wait_seconds=30) to follow it.",
+        **({"review_required": review_required(workflow)} if awaiting else {"poll_after_seconds": 60}),
+        "next": (
+            f"Not started yet: {EXPERIMENT_REVIEW}"
+            if awaiting
+            else f"Call experiment_get(experiment_id='{workflow['id']}', wait_seconds=30) to follow it."
+        ),
         "case_order": prepared.cases[:MAX_LISTED_CASES],
         "seed": prepared.seed,
         "eta_seconds": eta(prepared),
@@ -131,6 +147,36 @@ async def start(ctx: ToolContext, design: Any, expected_digest: str | None):
     return _started(workflow, prepared, artifacts)
 
 
+async def confirm(
+    ctx: ToolContext, experiment_id: str, plan_digests: dict[str, str], acknowledge_unknown: bool
+) -> dict[str, Any]:
+    """Confirm the reviewed plans of an experiment that is waiting for it; Lens then queues it."""
+    workflow = await load_workflow(ctx, experiment_id)
+    guard_owner(ctx, workflow)
+    if workflow.get("status") != "awaiting_review":
+        raise ToolError(
+            "conflict_state",
+            f"The experiment is {workflow.get('status')}, not awaiting_review.",
+            field="experiment_id",
+            hint="Only an experiment that experiment_get reports as awaiting_review can be confirmed.",
+        )
+    try:
+        confirmed = await ctx.api.request(
+            "POST",
+            f"/evaluate/evaluations/{experiment_id}/confirm",
+            body={"plan_digests": plan_digests, "acknowledge_unknown": acknowledge_unknown},
+            timeout=60,
+        )
+    except LensApiError as error:
+        raise plan_rejection(error) from error
+    return {
+        "experiment_id": experiment_id,
+        "status": confirmed.get("status"),
+        "poll_after_seconds": 60,
+        "next": f"Call experiment_get(experiment_id='{experiment_id}', wait_seconds=30) to follow it.",
+    }
+
+
 async def cancel(ctx: ToolContext, experiment_id: str, case_ids: list[str] | None) -> dict[str, Any]:
     workflow = await load_workflow(ctx, experiment_id)
     guard_owner(ctx, workflow)
@@ -161,6 +207,14 @@ async def cancel(ctx: ToolContext, experiment_id: str, case_ids: list[str] | Non
                 retryable=True,
             ) from error
         raise
+    except TimeoutError as error:
+        raise ToolError(
+            "cleanup_pending",
+            "Lens is still stopping the experiment and cleaning up its deployments.",
+            field="experiment_id",
+            hint="Call experiment_get to watch it, or experiment_cancel again once it has settled.",
+            retryable=True,
+        ) from error
     after = await load_workflow(ctx, experiment_id)
     before = {case_id: case.get("status") for case_id, case in known.items()}
     cancelled = [
@@ -196,9 +250,19 @@ async def retry(ctx: ToolContext, experiment_id: str) -> dict[str, Any]:
         if error.status == 409:
             raise ToolError("conflict_state", error.message(), field="experiment_id") from error
         raise
+    retried = retried or {}
+    if retried.get("status") == "awaiting_review":
+        # Cases that need a new deployment get fresh plans, which must be reviewed again.
+        return {
+            "experiment_id": experiment_id,
+            "status": "awaiting_review",
+            "requeued_case_ids": requeued,
+            "review_required": review_required(retried),
+            "next": f"Not restarted yet: {EXPERIMENT_REVIEW}",
+        }
     return {
         "experiment_id": experiment_id,
-        "status": (retried or {}).get("status"),
+        "status": retried.get("status"),
         "requeued_case_ids": requeued,
         "poll_after_seconds": 30,
     }

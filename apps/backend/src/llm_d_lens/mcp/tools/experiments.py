@@ -14,6 +14,7 @@ from ..evaluation_design import ExperimentDesign
 from ..evaluation_plan import describe, prepare
 from ..evaluation_results import case_rows, compare, result_view, run_row
 from ..evaluation_view import case_view, poll_after, remaining_seconds, summarize, watch
+from ..guide_fields import PD_GUIDE
 from ..kinds import register_kind
 from ..lens_api import LensApiError
 from ..path_ids import PathId, check_id
@@ -63,6 +64,22 @@ class GetExperimentInput(BaseModel):
     wait_seconds: int = Field(0, ge=0, le=MAX_WAIT_SECONDS, description="Really wait up to this many seconds.")
     wait_for: Literal["change", "terminal"] = Field(
         "change", description="change=return when progress changes; terminal=return only when it has finished."
+    )
+
+
+class ConfirmExperimentInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    experiment_id: str = Field(**EXPERIMENT_ID, description="An experiment that is awaiting_review.")
+    plan_digests: dict[str, str] = Field(
+        min_length=1,
+        max_length=64,
+        description="plan_id -> plan_digest for every plan in review_required.plans, copied exactly.",
+    )
+    acknowledge_unknown: bool = Field(
+        False,
+        description="Accept the scheduling constraints preflight could not check (plans[].preflight."
+        "unknown_constraints). Only after the user has seen them.",
     )
 
 
@@ -124,8 +141,14 @@ async def plan_experiment(ctx: ToolContext, args: PlanExperimentInput) -> dict[s
     result = describe(prepared)
     result["status"] = "valid_with_warnings" if result["warnings"] else "valid"
     result["not_checked"] = NOT_CHECKED
+    review = (
+        " It deploys prefill/decode sets, so Lens will hold it as awaiting_review until the user has reviewed the "
+        "plans and you call experiment_confirm."
+        if any(variant.fields["guide"] == PD_GUIDE for variant in prepared.variants.values())
+        else ""
+    )
     result["next"] = location_caveat(
-        "Call experiment_start with the same design and expected_digest=request_digest.",
+        f"Call experiment_start with the same design and expected_digest=request_digest.{review}",
         [variant.fields for variant in prepared.variants.values()],
     )
     return result
@@ -138,7 +161,9 @@ async def plan_experiment(ctx: ToolContext, args: PlanExperimentInput) -> dict[s
     "preserve_deployment is set. This tool saves one configuration artifact per variant, creates the workflow "
     "(experiment id = Lens workflow id) and never waits or advances anything; follow it with experiment_get. "
     "Pass expected_digest from experiment_plan to refuse a changed plan. Stop it with experiment_cancel, rerun a "
-    "failed one with experiment_retry, remove it with resource_delete.\n"
+    "failed one with experiment_retry, remove it with resource_delete. A design with prefill/decode deployments "
+    "returns status awaiting_review and review_required: the user must review the plans, then call "
+    "experiment_confirm.\n"
     "Side effects: creates configuration artifacts and a Lens evaluation workflow that deploys and benchmarks; "
     "resources: accelerators while it runs; duration: returns in seconds, the experiment takes minutes to hours; "
     "reversible: experiment_cancel.",
@@ -183,8 +208,8 @@ async def _details(ctx: ToolContext, experiment_id: str) -> dict[str, Any]:
 def _poll_phase(view: dict[str, Any]) -> str:
     if view.get("status") in ops.TERMINAL:
         return "terminal"
-    if view.get("status") == "cancelling":
-        return "cancelling"
+    if view.get("status") in ("cancelling", "awaiting_review"):
+        return view["status"]
     return (view.get("active_case") or {}).get("status") or "queued"
 
 
@@ -218,6 +243,8 @@ async def get_experiment(ctx: ToolContext, args: GetExperimentInput) -> dict[str
                 "matrix and concurrency_stages, so only deployment time is counted for them."
             )
     view["poll_after_seconds"] = poll_after(_poll_phase(view), eta_seconds)
+    if workflow.get("status") == "awaiting_review":
+        view["review_required"] = ops.review_required(workflow)
     if args.wait_seconds:
         view.update(waited_seconds=waited, wait_outcome=outcome)
     include = set(args.include)
@@ -231,6 +258,29 @@ async def get_experiment(ctx: ToolContext, args: GetExperimentInput) -> dict[str
     if "timeline" in include:
         view["timeline"] = _timeline(workflow)
     return view
+
+
+# Open question for reviewers: this tool costs one slot of the core profile and
+# only wraps Lens's confirm route. It is kept as its own tool so that an MCP
+# client can require human approval for exactly the call that releases the GPUs.
+# If the tool count matters more, drop it and leave confirmation to the Lens Web
+# UI; experiment_start would still report awaiting_review, but an agent could no
+# longer finish a prefill/decode experiment on its own.
+@tool(
+    "experiment_confirm",
+    "[S] Confirm the reviewed deployment plans of an experiment that experiment_start or experiment_get reports as "
+    "awaiting_review (it deploys prefill/decode DisaggregatedSets, which Lens only runs from reviewed plans). Pass "
+    "every plan_id with its plan_digest from review_required; Lens refuses a changed or failed plan. Ask the user "
+    "to review the plans first, in this conversation or in the Lens Web UI, unless they told you to go ahead. Then "
+    "follow it with experiment_get. Only the creator can confirm.\n"
+    "Side effects: queues the experiment, which then deploys and benchmarks; resources: accelerators while it runs; "
+    "duration: returns in seconds; reversible: experiment_cancel.",
+    ConfirmExperimentInput,
+    read_only=False,
+    open_world=True,
+)
+async def confirm_experiment(ctx: ToolContext, args: ConfirmExperimentInput) -> dict[str, Any]:
+    return await ops.confirm(ctx, args.experiment_id, args.plan_digests, args.acknowledge_unknown)
 
 
 @tool(
