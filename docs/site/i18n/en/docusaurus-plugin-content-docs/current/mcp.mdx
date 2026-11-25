@@ -62,7 +62,7 @@ A profile only limits what the server offers; Lens permissions are checked again
 
 | Profile | Tools |
 | --- | --- |
-| `core` | `cluster_list`, `cluster_get`, `placement_probe`, `guide_list`, `model_search`, `model_get`, `model_cache_create`, `deployment_plan`, `deployment_create`, `deployment_get`, `deployment_diagnose`, `deployment_test`, `deployment_logs`, `deployment_stop`, `experiment_plan`, `experiment_start`, `experiment_get`, `experiment_artifact_get`, `experiment_cancel`, `experiment_retry`, `result_compare`, `resource_list`, `resource_delete` |
+| `core` | `cluster_list`, `cluster_get`, `placement_probe`, `guide_list`, `model_search`, `model_get`, `model_cache_create`, `deployment_plan`, `deployment_create`, `deployment_get`, `deployment_diagnose`, `deployment_test`, `deployment_logs`, `deployment_stop`, `experiment_plan`, `experiment_start`, `experiment_get`, `experiment_artifact_get`, `experiment_confirm`, `experiment_cancel`, `experiment_retry`, `result_compare`, `resource_list`, `resource_delete` |
 | `serving` | `model_service_publish`, `model_service_get`, `model_service_test`, `model_service_update`, `model_service_access_grant`, `model_service_access_revoke` |
 | `storage` | `storage_volume_create`, `storage_volume_get`, `storage_volume_scan` |
 | `simulation` | `trace_dataset_list`, `trace_dataset_prepare`, `simulation_start`, `simulation_get`, `simulation_cancel` |
@@ -141,6 +141,15 @@ configuration; `deployment_name`, `description` and `model_cache_volume_id` are 
 context. `deployment_plan` validates and renders without creating anything and returns a `digest`;
 pass it to `deployment_create` as `expected_digest` and creation fails with `plan_stale` if the plan
 changed in between. Deployment reads include `configuration`.
+
+Prefill/decode (`DisaggregatedSet`) deployments run only from a plan the user has reviewed, as in the Web
+UI. For them `deployment_plan` freezes a Lens plan and returns `review` (`plan_id`, `plan_digest`, preflight
+errors, warnings and unknown constraints, workloads) and the generated `deployment_name`; pass `plan_id`,
+`plan_digest` and that `deployment_name` to `deployment_create`, plus `acknowledge_unknown` if the user
+accepts the constraints preflight could not check. An experiment with such deployments is returned by
+`experiment_start` as `awaiting_review` and starts only after `experiment_confirm`; retrying one goes back to review. In both cases ask the
+user to review the plan in the conversation or in the Lens Web UI (Evaluation, the experiment, Review
+deployment plans).
 
 ```json
 {"cluster_id":"cluster-example","configuration":{"guide":"optimized-baseline","model":"Qwen/Qwen3-0.6B","tensorParallelSize":1,"maxNumSeqs":64}}

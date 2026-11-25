@@ -58,7 +58,7 @@ profile 只限制服务器提供哪些工具；每次调用仍会再次校验 Le
 
 | Profile | 工具 |
 | --- | --- |
-| `core` | `cluster_list`、`cluster_get`、`placement_probe`、`guide_list`、`model_search`、`model_get`、`model_cache_create`、`deployment_plan`、`deployment_create`、`deployment_get`、`deployment_diagnose`、`deployment_test`、`deployment_logs`、`deployment_stop`、`experiment_plan`、`experiment_start`、`experiment_get`、`experiment_artifact_get`、`experiment_cancel`、`experiment_retry`、`result_compare`、`resource_list`、`resource_delete` |
+| `core` | `cluster_list`、`cluster_get`、`placement_probe`、`guide_list`、`model_search`、`model_get`、`model_cache_create`、`deployment_plan`、`deployment_create`、`deployment_get`、`deployment_diagnose`、`deployment_test`、`deployment_logs`、`deployment_stop`、`experiment_plan`、`experiment_start`、`experiment_get`、`experiment_artifact_get`、`experiment_confirm`、`experiment_cancel`、`experiment_retry`、`result_compare`、`resource_list`、`resource_delete` |
 | `serving` | `model_service_publish`、`model_service_get`、`model_service_test`、`model_service_update`、`model_service_access_grant`、`model_service_access_revoke` |
 | `storage` | `storage_volume_create`、`storage_volume_get`、`storage_volume_scan` |
 | `simulation` | `trace_dataset_list`、`trace_dataset_prepare`、`simulation_start`、`simulation_get`、`simulation_cancel` |
@@ -122,6 +122,12 @@ Lens 仍按自身版本再次校验请求。
 `cluster_id` 放在配置外；`deployment_name`、`description` 和 `model_cache_volume_id` 是可选的部署上下文。
 `deployment_plan` 只校验和渲染、不创建任何资源，并返回 `digest`；将其作为 `expected_digest` 传给
 `deployment_create`，若期间计划发生变化，创建会以 `plan_stale` 失败。部署读取包含 `configuration`。
+
+Prefill/decode（`DisaggregatedSet`）部署与 Web UI 一样，只能从用户评审过的计划运行。此时 `deployment_plan` 会冻结一个
+Lens 计划，返回 `review`（`plan_id`、`plan_digest`、预检错误、警告和未知约束、工作负载）以及生成的 `deployment_name`；
+把 `plan_id`、`plan_digest` 和该 `deployment_name` 传给 `deployment_create`，若用户接受预检无法检查的约束，再加
+`acknowledge_unknown`。含此类部署的实验由 `experiment_start` 以 `awaiting_review` 返回，须经 `experiment_confirm`
+才会开始，重试这类实验会再次回到评审状态。两种情况下都应请用户在对话中或 Lens Web UI（Evaluation、该实验、Review deployment plans）评审计划。
 
 ```json
 {"cluster_id":"cluster-example","configuration":{"guide":"optimized-baseline","model":"Qwen/Qwen3-0.6B","tensorParallelSize":1,"maxNumSeqs":64}}
