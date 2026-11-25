@@ -12,7 +12,7 @@ from typing import Annotated
 from fastapi import APIRouter, BackgroundTasks, File, Form, Query, Request, Response, UploadFile
 from pydantic import ValidationError
 
-from llm_d_lens.auth.access import current_principal, filter_by_cluster
+from llm_d_lens.auth.access import current_principal, filter_by_cluster, require_cluster_access
 from llm_d_lens.cluster import gateway_crds, images, registry, repo_downloads, service, sessions
 from llm_d_lens.cluster.deployment_source import resolve_cluster_benchmark_source, resolve_cluster_deployment_source
 from llm_d_lens.cluster.errors import ClusterOverviewError
@@ -681,7 +681,8 @@ async def overview(
     ),
     operation_id="get_cluster_topology",
 )
-async def cluster_topology(cluster_id: str) -> TopologyResponse:
+async def cluster_topology(cluster_id: str, request: Request) -> TopologyResponse:
+    require_cluster_access(current_principal(request), cluster_id)
     return TopologyResponse.model_validate(await service.get_topology(registry.require_cluster(cluster_id)))
 
 
@@ -696,7 +697,8 @@ async def cluster_topology(cluster_id: str) -> TopologyResponse:
     ),
     operation_id="probe_cluster_placement",
 )
-async def probe_placement(cluster_id: str, payload: PlacementProbeRequest) -> PlacementProbeResponse:
+async def probe_placement(cluster_id: str, payload: PlacementProbeRequest, request: Request) -> PlacementProbeResponse:
+    require_cluster_access(current_principal(request), cluster_id)
     roles = [role.model_dump(by_alias=True) for role in payload.roles]
     plan = await service.probe_placement(
         registry.require_cluster(cluster_id),

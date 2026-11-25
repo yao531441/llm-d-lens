@@ -105,7 +105,7 @@ complete but low level.
 
 | Aspect | Assistant tool catalog (`/api/assistant/mcp`) | Task MCP (`/api/mcp`) |
 | --- | --- | --- |
-| Granularity | One tool per REST operation | One tool per task (46) |
+| Granularity | One tool per REST operation | One tool per task (47) |
 | Output | Raw REST payloads | Summaries, derived progress, warnings, hints |
 | Waiting | `wait_for_status` polls a read tool | `wait_seconds` inside `<resource>_get`, bounded |
 | State | None | None |
@@ -124,13 +124,13 @@ has.
 
 | Profile | Tools | Default |
 | --- | --- | --- |
-| `core` | 23 | yes |
+| `core` | 24 | yes |
 | `serving` | 6 | no |
 | `storage` | 3 | no |
 | `simulation` | 5 | no |
 | `lens-settings` | 2 | no |
 | `cluster-admin` | 7 | no |
-| Total | 46 | |
+| Total | 47 | |
 
 `cluster-admin` changes shared infrastructure and stays out of the default.
 
@@ -176,8 +176,9 @@ section records the design: what each tool composes and the rules it follows.
 - **Enums.** Every closed set is a JSON Schema `enum`.
 - **Side-effect line.** Every description ends with a `Side effects` line stating side effects, resources,
   duration and reversibility.
-- **Plans are pure reads.** `deployment_plan` and `experiment_plan` create nothing; the matching start tool
-  re-plans and compares a digest (§5.3).
+- **Plans create nothing you must clean up.** `deployment_plan` and `experiment_plan` create no deployment; the
+  matching start tool re-plans and compares a digest (§5.3). The one exception is a prefill/decode
+  (`DisaggregatedSet`) deployment, which Lens only runs from a reviewed, frozen plan (§5.4.2).
 
 ### 5.2 Shared input: `GuidePlanFields`
 
@@ -221,7 +222,7 @@ field paths. Plans report the resolved `source` and `applied_custom_patches`.
 | Tool | Purpose | Composes |
 | --- | --- | --- |
 | `deployment_plan` | Pure read: what Lens would deploy. Input is exactly one of `configuration` (`GuidePlanFields`) or `from_deployment_id` (copy of a visible deployment with its exact Lens configuration and storage binding). Returns validity, accelerators, resolved image, deduplicated warnings and a `digest` | `POST /api/guide-planning/plan`, render |
-| `deployment_create` | Create a deployment run as the UI does; `expected_digest` guards against a changed plan | plan, `POST /api/deployments/runs` |
+| `deployment_create` | Create a deployment run as the UI does; `expected_digest` guards against a changed plan; a prefill/decode deployment also needs the frozen `plan_id` and `plan_digest` (§5.4.2) | plan, `POST /api/deployments/runs` |
 | `deployment_get` | Run, case and execution state with per-role pod readiness; `include` enum `verifications`; `wait_seconds` | run, execution, execution pods |
 | `deployment_stop` | Scale to zero to free accelerators; keeps record, namespace and configuration | cancel run while creating, stop case once ready |
 | `deployment_diagnose` | Rule-based diagnosis with evidence and hints | execution, pods, scheduler events, logs |
@@ -237,6 +238,29 @@ counts) and the rendered configuration with its guide source, with the deploymen
 does not change it; a guide or render change that leaves the inputs equal therefore also yields `plan_stale`.
 Nothing is stored between the two calls. A deployment is modified by stopping it and
 creating a copy (`from_deployment_id`); there is no in-place update or restart.
+
+#### 5.4.2 Prefill/decode deployments need a reviewed plan
+
+Lens refuses to create a `DisaggregatedSet` run directly (`prepared plan required`): the user must see the
+rendered manifests and the preflight result first. The task tools follow the same flow as the Web UI:
+
+1. `deployment_plan` freezes a Lens prepared plan (`POST /api/deployments/plans`) and returns a `review` view:
+   `plan_id`, `plan_digest`, the preflight status with its errors, warnings and unknown constraints, and the
+   namespace and manifest checksum of each workload. A failed preflight makes the plan `invalid`. The reply
+   also carries the generated `deployment_name`, because the frozen plan is bound to the exact request.
+2. The agent shows the review to the user and reminds them they can inspect the same plan in the Web UI.
+3. `deployment_create` takes `plan_id`, `plan_digest`, the same `deployment_name` and, only if the user accepts
+   the constraints preflight could not check, `acknowledge_unknown`. It sends exactly the frozen request;
+   Lens answers 409 (`plan_stale`, `unknown_not_acknowledged`) when the plan changed, expired or still has
+   unacknowledged unknown constraints. Without a `plan_id` it returns `plan_required` before calling Lens.
+
+Experiments work the same way, with Lens' own state: `experiment_start` of a design with prefill/decode
+deployments returns `status: "awaiting_review"` and `review_required` (one review view per case), starts
+nothing and gives no `poll_after_seconds`. `experiment_confirm(experiment_id, plan_digests,
+acknowledge_unknown)` calls `POST /api/evaluate/evaluations/{id}/confirm` with the digests echoed back, and Lens
+queues the experiment. The user can equally review and confirm it in the Web UI (Evaluation, the experiment,
+Review deployment plans). `experiment_cancel` works from this state. `experiment_retry` of such an experiment
+returns `awaiting_review` again, with the new plans Lens froze for the retried cases, and needs a new confirmation.
 
 #### 5.4.1 Deployment verification
 
@@ -260,6 +284,7 @@ Lifecycle and request building are in §6.
 | `experiment_start` | Create the Evaluation workflow; `expected_digest` guards against a changed plan | the above, save configuration artifact per variant, create evaluation |
 | `experiment_get` | Status, progress, active case, stale verdict, ETA, quality; `include` enum `cases, results, comparison, points, timeline`; `wait_seconds` (0 to 50), `wait_for` | workflow, benchmark run, deployment run; workflow details only when results are requested |
 | `experiment_artifact_get` | List the native benchmark reports of a case, or read one with summary statistics and the Lens download path | run artifacts routes (§10) |
+| `experiment_confirm` | Confirm the reviewed plans of an experiment that is `awaiting_review` (prefill/decode deployments, §5.4.2) | confirm workflow plans |
 | `experiment_cancel` | Cancel a workflow or some cases | cancel workflow, cancel case |
 | `experiment_retry` | Requeue failed or cancelled cases | retry workflow |
 | `result_compare` | Compare plans across experiments and standalone benchmark runs: median, min, max, delta versus a baseline, SLA verdicts | workflow details, benchmark runs |
@@ -295,7 +320,9 @@ the configuration artifacts it saved with it) and, for storage volumes, never de
 | `lens-settings` | `ai_provider_list`, `ai_provider_test` (reaches an external service) |
 | `cluster-admin` | `cluster_component_check` (read installation status and preflight), `cluster_component_install` (CRDs, LeaderWorkerSet, monitoring, accelerator monitoring, model gateway at the versions Lens pins; accelerator drivers are never installed), `image_prepull`, `model_gateway_configure`, `model_gateway_reconcile`, `orphan_resource_list`, `orphan_resource_delete` |
 
-The `cluster-admin` tools call routes that Lens restricts to administrators. They also refuse shared
+The `cluster-admin` tools call routes that Lens authorizes with its ordinary cluster and model-service
+permissions, so a maintainer reaches them too; several of them are not limited to the caller's clusters
+in Lens today. Keeping the profile off by default is what keeps an agent away from them. The tools also refuse shared
 infrastructure namespaces (`kube-*`, `monitoring`, `llm-d-monitoring`, `intel-xpumd`, `lws-system`,
 `istio-system`, `lens-gateway*`) by name before any Lens call, and `orphan_resource_delete` needs each
 namespace together with the `created_at` Lens listed for it. Node cordon and uncordon are not exposed: node
@@ -380,7 +407,7 @@ sequenceDiagram
     T->>L: plan + render again, save artifacts, create evaluation
     L-->>T: workflow (queued)
     T-->>A: experiment_id, poll_after_seconds
-    Note over L: Lens deploys, benchmarks, cleans up; survives restarts
+    Note over L: Lens deploys, benchmarks, cleans up, and survives restarts
     A->>T: experiment_get(experiment_id, wait_seconds)
     T-->>A: status, active_case, stale, ETA
     A->>T: experiment_get(include=[results]) / experiment_artifact_get

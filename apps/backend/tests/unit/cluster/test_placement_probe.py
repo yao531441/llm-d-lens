@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 
 import pytest
@@ -238,3 +239,29 @@ async def test_topology_is_unsupported_when_the_cluster_publishes_no_accelerator
         await service.get_topology(cluster)
 
     assert error.value.code == "topology_unsupported"
+
+
+@pytest.mark.asyncio
+async def test_topology_and_placement_probe_are_limited_to_the_callers_clusters(monkeypatch):
+    from types import SimpleNamespace
+
+    from llm_d_lens.auth.contracts import Principal, RoleBinding, ScopeType
+    from llm_d_lens.cluster.models import PlacementProbeRequest
+    from llm_d_lens.core.exceptions import ForbiddenError
+
+    router = importlib.import_module("llm_d_lens.cluster.router")
+
+    binding = RoleBinding("end-user", ScopeType.CLUSTER, scope_cluster_id="mine")
+    principal = Principal(user_id="u1", username="u1", bindings=(binding,), group_ids=frozenset())
+    request = SimpleNamespace(state=SimpleNamespace(principal=principal))
+    payload = PlacementProbeRequest.model_validate(
+        {"roles": [{"name": "decode", "replicas": 1, "tensorParallelSize": 1}]}
+    )
+    reached = []
+    monkeypatch.setattr(registry, "require_cluster", lambda cluster_id: reached.append(cluster_id))
+
+    with pytest.raises(ForbiddenError):
+        await router.cluster_topology("other", request)
+    with pytest.raises(ForbiddenError):
+        await router.probe_placement("other", payload, request)
+    assert reached == []
