@@ -12,7 +12,7 @@ from typing import Annotated
 from fastapi import APIRouter, BackgroundTasks, File, Form, Query, Request, Response, UploadFile
 from pydantic import ValidationError
 
-from llm_d_lens.auth.access import current_principal, filter_by_cluster
+from llm_d_lens.auth.access import current_principal, filter_by_cluster, require_cluster_access
 from llm_d_lens.cluster import gateway_crds, images, registry, repo_downloads, service, sessions
 from llm_d_lens.cluster.deployment_source import resolve_cluster_benchmark_source, resolve_cluster_deployment_source
 from llm_d_lens.cluster.errors import ClusterOverviewError
@@ -30,10 +30,13 @@ from llm_d_lens.cluster.models import (
     NodeMaintenanceRequest,
     NodeMaintenanceResponse,
     OverviewResponse,
+    PlacementProbeRequest,
+    PlacementProbeResponse,
     ProxyConfigDTO,
     RepoDownloadStatus,
     SoftwareDownloadRequest,
     SoftwareDownloadStatusResponse,
+    TopologyResponse,
 )
 from llm_d_lens.cluster.sdk_discovery import router as planning_discovery_router
 from llm_d_lens.infrastructure.network.hostinfo import local_host_addresses
@@ -665,6 +668,45 @@ async def overview(
         fetched_at=datetime.now(UTC).isoformat(),
         kubernetes=KubernetesSummary.model_validate(kubernetes),
     )
+
+
+@router.get(
+    "/clusters/{cluster_id}/topology",
+    response_model=TopologyResponse,
+    summary="Get the PCIe-root topology of a cluster and which roots are entirely free.",
+    description=(
+        "Group the cluster's DRA devices into PCIe roots per node. A tensor-parallel group needs whole roots, "
+        "so free capacity is reported per root (all GPUs unallocated and, for hardware with RDMA NICs, the NIC "
+        "available) rather than as a GPU total. Hardware without topology support returns 409 topology_unsupported."
+    ),
+    operation_id="get_cluster_topology",
+)
+async def cluster_topology(cluster_id: str, request: Request) -> TopologyResponse:
+    require_cluster_access(current_principal(request), cluster_id)
+    return TopologyResponse.model_validate(await service.get_topology(registry.require_cluster(cluster_id)))
+
+
+@router.post(
+    "/clusters/{cluster_id}/placement/probe",
+    response_model=PlacementProbeResponse,
+    summary="Check whether prefill/decode style roles can be placed on whole free PCIe roots now.",
+    description=(
+        "Each replica of each role takes tensorParallelSize / gpusPerRoot whole free roots on one node. Roles can "
+        "be required to use different nodes. The answer is advisory: capacity can change before the deployment is "
+        "created. Returns the pods per node for each role, or the reasons it does not fit."
+    ),
+    operation_id="probe_cluster_placement",
+)
+async def probe_placement(cluster_id: str, payload: PlacementProbeRequest, request: Request) -> PlacementProbeResponse:
+    require_cluster_access(current_principal(request), cluster_id)
+    roles = [role.model_dump(by_alias=True) for role in payload.roles]
+    plan = await service.probe_placement(
+        registry.require_cluster(cluster_id),
+        roles,
+        role_nodes_disjoint=payload.role_nodes_disjoint,
+        exclude_nodes=tuple(payload.exclude_nodes),
+    )
+    return PlacementProbeResponse.model_validate(plan)
 
 
 @router.get(

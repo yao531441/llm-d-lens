@@ -9,6 +9,7 @@ import { Button } from '../../shared/ui/Button';
 import { HelpTooltip } from '../../shared/ui/FormControls';
 import { SimulationIcon } from '../../pages/simulation';
 import { ChangePasswordModal, useAuth } from '../../pages/auth';
+import { AccessTokensModal } from '../../pages/auth/AccessTokensModal';
 import { NAVIGATION_GROUPS } from '../routes/views';
 
 const MENU_ICONS = {
@@ -37,6 +38,7 @@ export default function LeftNavigation({ currentView, onNavigate, isMobileOpen, 
     const { canView, principal, logout } = useAuth();
     const [accountMenuOpen, setAccountMenuOpen] = useState(false);
     const [showChangePassword, setShowChangePassword] = useState(false);
+    const [showAccessTokens, setShowAccessTokens] = useState(false);
     const accountMenuRef = useRef(null);
     const activeAdminSection = NAVIGATION_GROUPS.find(group => group.id === 'administration')
         ?.items.find(item => item.view === currentView)?.section || null;
@@ -297,6 +299,11 @@ export default function LeftNavigation({ currentView, onNavigate, isMobileOpen, 
                                     >
                                         Change password
                                     </button>
+                                    <button type="button" role="menuitem"
+                                        onClick={() => { setAccountMenuOpen(false); setShowAccessTokens(true); }}
+                                        className="block w-full px-3 py-2 text-left text-xs text-theme-text transition-colors hover:bg-theme-bg">
+                                        Personal access tokens
+                                    </button>
                                     <button
                                         type="button"
                                         role="menuitem"
@@ -338,6 +345,7 @@ export default function LeftNavigation({ currentView, onNavigate, isMobileOpen, 
                 onSaved={() => setShowChangePassword(false)}
             />
         )}
+        {showAccessTokens && <AccessTokensModal onClose={() => setShowAccessTokens(false)} />}
         </>
     );
 }

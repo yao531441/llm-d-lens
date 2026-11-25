@@ -12,6 +12,35 @@ import TabItem from '@theme/TabItem';
 
 身份验证与管理相关路由位于 `llm_d_lens/auth/router.py` 中的 `/api/v1` 前缀下。
 
+### 个人访问 token
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+
+以下三个端点均要求正常登录会话，浏览器写请求要求 CSRF。
+`GET /api/v1/auth/access-tokens` 仅返回当前用户自己的 token 元数据。
+`POST /api/v1/auth/access-tokens` 接受 `{"name":"MCP","expiresInDays":30}`
+（名称非空且不超过 100 字符；有效期为 1–365 的整数，默认 30 天），
+返回 HTTP 201、元数据和仅展示一次的 `token`，并设置 `Cache-Control: no-store`。
+`DELETE /api/v1/auth/access-tokens/{token_id}` 返回 204，重复撤销同样返回 204；
+不存在或属于其他用户的 ID 返回 404。
+
+元数据字段为 `id`、`user_id`、`name`、`token_prefix`、`created_at`、`expires_at`、
+`last_used_at`、`revoked_at`。列表不包含 hash 或明文。
+PAT Bearer 实时继承用户 RBAC，但不能管理凭据。无效、过期或已撤销 PAT 返回 401；
+使用 PAT 管理凭据返回 403。PAT 不能作为会话 Cookie 使用。
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+
+`AuthService.create_personal_token(principal, name, expires_in_days)` 为活跃用户的登录会话身份
+返回 `(PersonalAccessTokenRecord, plaintext)`。
+`validate_personal_token(plaintext)` 返回当前受限制 principal 或 `None`。
+`revoke_personal_token(principal, token_id)` 校验登录会话身份和 token 所有权。
+这些服务方法供已授权的应用代码使用；公共元数据序列化必须排除 `token_hash`，
+不得持久化或记录明文。
+  </TabItem>
+</Tabs>
+
 ### 资源绑定限制
 
 模型推理授权替代了部署分享。资源级绑定只接受

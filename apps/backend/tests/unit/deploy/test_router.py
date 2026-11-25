@@ -748,6 +748,10 @@ async def test_list_ready_executions_is_side_effect_free_and_filtered(monkeypatc
     assert len(response["items"]) == 1
     assert response["items"][0] == {
         "execution_id": "execution-ready",
+        "run_id": "run-1",
+        "case_id": "case-execution-ready",
+        "ownership": "unknown",
+        "capabilities": {"connect": False, "update": False, "stop": False, "delete": False},
         "status": "ready",
         "cluster_id": "cluster-1",
         "cluster_session_id": "session-1",
@@ -784,8 +788,8 @@ async def test_list_ready_executions_is_side_effect_free_and_filtered(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_execution_payload_omits_run_and_case_identifiers(monkeypatch):
-    """run_id/case_id stay inside Deploy and must not leak to API consumers."""
+async def test_execution_payload_exposes_canonical_run_and_case_links(monkeypatch):
+    """Execution links let Web and MCP address the same deployment case."""
     ready = _execution("execution-ready", DeploymentStatus.READY)
     run = SimpleNamespace(
         id="run-1",
@@ -802,8 +806,8 @@ async def test_execution_payload_omits_run_and_case_identifiers(monkeypatch):
     payload = await router.get_execution("execution-ready")
 
     assert payload["execution_id"] == "execution-ready"
-    assert "run_id" not in payload
-    assert "case_id" not in payload
+    assert payload["run_id"] == "run-1"
+    assert payload["case_id"] == "case-execution-ready"
 
 
 @pytest.mark.asyncio

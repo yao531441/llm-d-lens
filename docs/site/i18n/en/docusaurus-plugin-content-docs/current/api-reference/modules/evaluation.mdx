@@ -732,6 +732,58 @@ if run is not None and run.get("status") in {"succeeded", "failed", "cancelled"}
   </TabItem>
 </Tabs>
 
+### List benchmark run reports
+
+List the lifecycle reports the benchmark harness saved for a run: summary, per-stage and per-request files, and the harness config. Matrix runs prefix each point's files with `matrix-N/`. Reports kept only in a workspace archive are not listed individually; their directories appear in `archived_in` and the standard names can still be downloaded.
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`GET /api/v1/evaluate/runs/{run_id}/artifacts`**
+
+    ```json
+    {
+      "items": [
+        {"name": "per_request_lifecycle_metrics.json", "size_bytes": 1048576},
+        {"name": "stage_0_lifecycle_metrics.json", "size_bytes": 2048}
+      ],
+      "archived_in": []
+    }
+    ```
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    from llm_d_lens.evaluation.router import list_run_artifacts
+
+    listing = await list_run_artifacts("7d698fda-8e2e-44b2-86aa-14d24098350d")
+    print([item["name"] for item in listing["items"]])
+    ```
+  </TabItem>
+</Tabs>
+
+### Download a benchmark run report
+
+Return the raw bytes of one report, for example `per_request_lifecycle_metrics.json` for the individual request records. Files up to 64 MiB are served, from the loose file or the run's workspace archive. A name outside the lifecycle report set returns `422`; a report that was not saved or cannot be read returns `404`.
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`GET /api/v1/evaluate/runs/{run_id}/artifacts/{name}`**
+
+    - Path parameters: `run_id` (`string`, required), `name` (`string`, required; `config.yaml`, `summary_lifecycle_metrics.json`, `stage_<n>_lifecycle_metrics.json` or `per_request_lifecycle_metrics.json`, optionally prefixed with `matrix-N/`)
+
+    Response: the report body, `application/json` (`application/yaml` for `config.yaml`).
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    from llm_d_lens.evaluation.router import get_run_artifact
+
+    response = await get_run_artifact(
+        "7d698fda-8e2e-44b2-86aa-14d24098350d", "per_request_lifecycle_metrics.json"
+    )
+    rows = response.body
+    ```
+  </TabItem>
+</Tabs>
+
 ### Start a deployment-plus-benchmark workflow
 
 Start a simple deployment-plus-benchmark workflow that first creates an optimized baseline deployment, then benchmarks it.

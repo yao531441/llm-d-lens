@@ -110,6 +110,29 @@ def test_non_owner_cannot_touch_foreign_deployment():
     assert not authorize(other, "monitoring:deployment:action", resource=resource).allowed
 
 
+def test_execution_capabilities_use_native_rbac_without_exposing_owner_ids():
+    from types import SimpleNamespace
+
+    from llm_d_lens.deploy.router import _execution_payload
+
+    context = SimpleNamespace(
+        run_id="r1",
+        execution_id="e1",
+        case_id="case1",
+        cluster_id="c1",
+        api_payload=lambda: {},
+    )
+    creator = _execution_payload(context, _end_user(), ("u1", None))
+    other = _execution_payload(context, _end_user(user_id="u2"), ("u1", None))
+    maintainer = _execution_payload(context, _maintainer(user_id="u2"), ("u1", None))
+    unknown = _execution_payload(context, _end_user(), (None, None))
+    assert creator["ownership"] == "self" and all(creator["capabilities"].values())
+    assert other["ownership"] == "other" and not any(other["capabilities"].values())
+    assert maintainer["ownership"] == "other" and all(maintainer["capabilities"].values())
+    assert unknown["ownership"] == "unknown" and not any(unknown["capabilities"].values())
+    assert "owner_user_id" not in creator and "owner_group_id" not in creator
+
+
 def test_owner_group_member_can_operate_but_not_delete():
     member = _end_user(groups=frozenset({"g1"}), user_id="u3")
     resource = _deployment(owner="creator", owner_group="g1")

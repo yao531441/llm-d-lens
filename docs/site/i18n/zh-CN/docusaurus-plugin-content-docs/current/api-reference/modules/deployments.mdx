@@ -623,6 +623,47 @@ def simulation_projection(execution: DeploymentExecution) -> SimulationDeploymen
 
 ## 后端 API
 
+### 部署检查
+
+| 方法及路径（前缀 `/api/v1/deployments`） | 权限 | 结果 |
+| --- | --- | --- |
+| `POST /executions/{execution_id}/verifications` | `deployment:execution:connect` | `202`，已持久化的 queued 检查 |
+| `GET /executions/{execution_id}/verifications` | `deployment:run:read` | `{items: [...]}`，最近 20 条，最新在前 |
+| `GET /executions/{execution_id}/verifications/{verification_id}` | `deployment:run:read` | 单条已保存记录，不存在则 `404` |
+
+三个入口均校验部署资源范围。POST 接受 `checks`（`chat`、`prefix_cache`
+的非空无重复子集，默认 `["chat"]`）和严格整数
+`requests`（1–20，默认 10）。prefix cache 要求总预算至少 10，其中六次用于重复前缀。
+非法请求体返回 `422`；部署未 ready、缺少 model 或已有活跃检查时返回 `409`。
+
+记录包括 `id`、`execution_id`、`request`、`status`（`queued|running|succeeded|failed`）、
+时间戳、`requests_sent`、`requests_completed`、`requests_succeeded`、`output_tokens`、
+`max_output_tokens`；完成后包含 `verdict`、`evidence_sufficient` 和 `checks[].evidence`。
+已尝试数在 HTTP 发出前计数，completed 指收到 HTTP 响应，不等于成功 completion。
+不暴露模型回复文本或 owner 身份。任务完成和证据判定分开；新任务不接受 KV/rank/routing
+检查，旧记录仍可读取。零值或缺失缓存计数保持 inconclusive；其他请求的网络错误不会掩盖
+已经观察到的 chat 失败。单个请求超时为 10 秒，整个检查超时为 120 秒，超时后标记失败并保留已达到的计数；后端重启时遗留的未完成任务在下次启动时标记失败，不自动重放（这假定只有一个 Lens 后端进程，与 Lens 其他后台任务一致）。
+`prefix_cache` 检查只证明单个模型服务器复用了重复的 prompt 前缀，不测试 llm-d 的前缀感知路由；vLLM 只有在使用 `--enable-prompt-tokens-details` 启动时才返回 `cached_tokens`，否则结论保持 `inconclusive`。
+读取无生命周期副作用。记录位于现有 diagnostics JSON，stop/clean 后保留，删除 execution
+历史时移除；活跃检查注册为部署消费者。
+
+```python
+from llm_d_lens.deploy.verification import start_verification, get_verification
+from llm_d_lens.deploy.verification_checks import VerificationRequest
+
+# Inside an authorized async request/task on the Lens host:
+task = start_verification("execution-1", VerificationRequest(checks=["chat"], requests=2))
+saved = get_verification("execution-1", task["id"])  # persisted-only read
+```
+
+服务函数要求调用者先完成资源鉴权；公共 REST 路由为 Web 和 MCP 执行相同校验。无需数据库迁移。
+
+停止、清理、重启及删除操作会先检查 Deploy 注册的 usage probe，再修改工作负载或删除记录。
+活跃 evaluation 消费者及已发布的 model-service member 会以 HTTP `409` 和
+`deployment_in_use` 阻止操作；销毁前需先取消发布 member。probe 失败时保守拒绝操作。
+删除 run 会在开始清理前检查所有 case。Python worker 调用者收到
+`deploy.usage.DeploymentInUseError`（`ValueError` 子类）。这些状态检查不提供针对并发启动消费者的原子预留锁。
+
 Guide 兼容端点保留 `{ "error": "..." }` 响应结构。
 预期的校验失败保留可操作的错误提示及状态码。
 目录加载和准备阶段的非预期错误返回通用 `502` 响应；
@@ -647,6 +688,13 @@ Guide 兼容端点保留 `{ "error": "..." }` 响应结构。
 [存储环境设置](/environment-variables)。旧 `.llm-d-bench/deploy` 和主机专属的
 `/root/.llm_d_lens/run_store` 不再是当前存储契约。
 执行发现使用 `execution_id` 作为跨模块引用，列表查询不会建立端口转发。
+
+execution 列表与详情 REST 响应还返回 `run_id`、`case_id`、`ownership`（`self`、`other`、`unknown`）
+和 `capabilities`（`update`、`stop`、`delete`）。能力按当前调用者及写操作相同的 RBAC 规则计算，
+仅供提示，写操作仍会重新鉴权；不会返回 owner 用户/组 ID。来源 run 存在时，详情中的
+`configuration` 是按 case 的 `source_configuration_ordinal` 选出的完整 `DeployableConfiguration`。
+这是保存的配置，不是从手动扩缩容后的现场状态重建的配置。
+Python `ExecutionContext.api_payload()` 保持中立运行时投影；调用者相关字段由 REST router 添加。
 需要主机可达地址时应调用执行端点连接操作，不能假定持久化的集群内地址或旧隧道仍然可达。
 
 | 记录 | 生命周期状态 |

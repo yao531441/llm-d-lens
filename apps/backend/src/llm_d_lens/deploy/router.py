@@ -21,6 +21,7 @@ from llm_d_lens.auth.access import (
     visible_cluster_ids,
 )
 from llm_d_lens.db.dao.deployment_batch import DeploymentBatchDao
+from llm_d_lens.deploy import verification
 from llm_d_lens.deploy.application import deployment_run_manager
 from llm_d_lens.deploy.contracts import (
     DeploymentCaseStatus,
@@ -58,6 +59,8 @@ from llm_d_lens.deploy.standard_kubernetes_service import (
     StandardKubernetesServiceRequest,
     build_standard_kubernetes_service_configuration,
 )
+from llm_d_lens.deploy.usage import DeploymentInUseError
+from llm_d_lens.deploy.verification_checks import VerificationRequest
 from llm_d_lens.hardware.resolver import deployment_mode
 from llm_d_lens.infrastructure.kubernetes import PortForwardError, list_resources
 
@@ -311,6 +314,7 @@ async def _refresh_deployment_records() -> None:
 @router.on_event("startup")
 async def start_deployment_record_refresh() -> None:
     global _refresh_task
+    verification.fail_interrupted_verifications()
     for run in _store.list_runs():
         if run.status == DeploymentRunStatus.CANCELLING:
             deployment_run_manager.reconcile_interrupted_cancellation(run.id)
@@ -629,6 +633,45 @@ def _require_execution(execution_id: str):
     return context
 
 
+def _execution_payload(context, principal, owner=None):
+    """Expose canonical links and existing policy decisions without exposing owner identities."""
+    if owner is None:
+        owner = _owner_for_run(context.run_id)
+    user_id, group_id = owner if owner else (None, None)
+    ownership = "unknown" if not user_id else "self" if principal and user_id == principal.user_id else "other"
+
+    def allowed(permission, *, run_only=False):
+        if principal is None:
+            return False
+        return any(
+            resource_readable(
+                principal,
+                permission=permission,
+                resource_type=kind,
+                resource_id=identifier,
+                cluster_id=context.cluster_id,
+                owner_user_id=user_id,
+                owner_group_id=group_id,
+            )
+            for kind, identifier in (("deployment_run", context.run_id), ("deployment_execution", context.execution_id))
+            if identifier and (not run_only or kind == "deployment_run")
+        )
+
+    payload = context.api_payload()
+    payload.update(
+        run_id=context.run_id,
+        case_id=context.case_id,
+        ownership=ownership,
+        capabilities={
+            "connect": allowed("deployment:execution:connect"),
+            "update": allowed("deployment:execution:update"),
+            "stop": allowed("deployment:case:execute", run_only=True),
+            "delete": allowed("deployment:execution:delete"),
+        },
+    )
+    return payload
+
+
 def _list_runs(query: str = "", principal=None):
     needle = query.lower().strip()
     runs = list(reversed(_store.list_runs()))
@@ -740,12 +783,12 @@ async def list_executions(
         limit=limit,
         allowed_cluster_ids=visible_cluster_ids(principal),
     )
+    owners = DeploymentBatchDao().owner_map([context.run_id for context in contexts])
     if principal is not None:
-        owners = DeploymentBatchDao().owner_map([context.run_id for context in contexts])
         contexts = [
             context for context in contexts if _execution_readable(principal, context, owners.get(context.run_id))
         ]
-    return {"items": [context.api_payload() for context in contexts]}
+    return {"items": [_execution_payload(context, principal, owners.get(context.run_id)) for context in contexts]}
 
 
 @router.get(
@@ -764,8 +807,14 @@ async def get_execution(execution_id: str, request: Request = None):
     context = find_execution_context(execution_id)
     if context is None:
         raise HTTPException(status_code=404, detail="deployment execution not found")
-    _require_execution_permission(current_principal(request), context, "deployment:run:read")
-    return context.api_payload()
+    principal = current_principal(request)
+    _require_execution_permission(principal, context, "deployment:run:read")
+    payload = _execution_payload(context, principal)
+    run = _store.get_run(context.run_id) if context.run_id else None
+    case = next((case for case in run.cases if case.id == context.case_id), None) if run else None
+    if case and 0 <= case.source_configuration_ordinal < len(run.source_configurations):
+        payload["configuration"] = run.source_configurations[case.source_configuration_ordinal].model_dump(mode="json")
+    return payload
 
 
 @router.get(
@@ -971,6 +1020,59 @@ async def get_execution_pod_logs(
         "logs": logs,
         "success": result.returncode == 0,
     }
+
+
+@router.post(
+    "/executions/{execution_id}/verifications",
+    status_code=202,
+    operation_id="create_deployment_verification",
+    summary="Start a bounded deployment verification.",
+    description="Persist and start a small inference check on the Lens host. Returns a verification id immediately; "
+    "read its persisted result without replaying requests. The request budget includes prefix warmup.",
+)
+async def create_verification(execution_id: str, request: VerificationRequest, http_request: Request = None):
+    context = find_execution_context(execution_id)
+    if context is None:
+        raise HTTPException(status_code=404, detail="deployment execution not found")
+    principal = current_principal(http_request)
+    _require_execution_permission(principal, context, "deployment:execution:connect")
+    try:
+        return verification.start_verification(execution_id, request)
+    except ValueError as error:
+        return problem(409, "Verification cannot start", str(error), "deployment_conflict")
+
+
+@router.get(
+    "/executions/{execution_id}/verifications",
+    operation_id="list_deployment_verifications",
+    summary="List persisted deployment verifications.",
+    description="Read the most recent 20 verification records attached to this execution. Does not send inference "
+    "requests or advance task lifecycle. Records survive stop and clean, and are removed with the execution.",
+)
+async def list_verifications(execution_id: str, request: Request = None):
+    context = find_execution_context(execution_id)
+    if context is None:
+        raise HTTPException(status_code=404, detail="deployment execution not found")
+    _require_execution_permission(current_principal(request), context, "deployment:run:read")
+    return {"items": verification.list_verifications(execution_id)}
+
+
+@router.get(
+    "/executions/{execution_id}/verifications/{verification_id}",
+    operation_id="get_deployment_verification",
+    summary="Get a persisted deployment verification.",
+    description="Read a verification's lifecycle, request budget, actual counts and evidence-qualified verdict. "
+    "Reads never send requests or resume an interrupted task.",
+)
+async def get_verification(execution_id: str, verification_id: str, request: Request = None):
+    context = find_execution_context(execution_id)
+    if context is None:
+        raise HTTPException(status_code=404, detail="deployment execution not found")
+    _require_execution_permission(current_principal(request), context, "deployment:run:read")
+    try:
+        return verification.get_verification(execution_id, verification_id)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
 
 
 @router.patch(
@@ -1218,13 +1320,15 @@ async def get_run(run_id: str, request: Request = None):
     ),
     operation_id="delete_deployment_run",
 )
-async def delete_run(run_id: str, request: Request = None) -> None:
+async def delete_run(run_id: str, request: Request = None):
     run = _store.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="deployment run not found")
     _require_run_permission(current_principal(request), run, "deployment:execution:delete")
     try:
         await deployment_run_manager.worker_for_run(run_id).delete_run(run_id)
+    except DeploymentInUseError as error:
+        return problem(409, "Deployment is in use", str(error), "deployment_in_use")
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
 
@@ -1352,6 +1456,8 @@ async def stop_case(run_id: str, case_id: str, request: Request = None):
         _require_run_permission(current_principal(request), run, "deployment:case:execute")
     try:
         case, execution = await deployment_run_manager.worker_for_run(run_id).stop_case(run_id, case_id)
+    except DeploymentInUseError as error:
+        return problem(409, "Deployment is in use", str(error), "deployment_in_use")
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     return _case_response(case, execution)
@@ -1390,6 +1496,8 @@ async def restart_case(run_id: str, case_id: str, request: RestartCaseRequest, h
         case = await deployment_run_manager.worker_for_run(run_id).restart_case(
             run_id, case_id, model_token=(request.model_token or "").strip() or None
         )
+    except DeploymentInUseError as error:
+        return problem(409, "Deployment is in use", str(error), "deployment_in_use")
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     return {"case": case}
@@ -1412,6 +1520,8 @@ async def clean_case(run_id: str, case_id: str, request: CleanCaseRequest, http_
         case, execution = await deployment_run_manager.worker_for_run(run_id).clean_case(
             run_id, case_id, preserve_rendered_overlay=request.preserve_rendered_overlay
         )
+    except DeploymentInUseError as error:
+        return problem(409, "Deployment is in use", str(error), "deployment_in_use")
     except ValueError as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     return _case_response(case, execution)

@@ -760,6 +760,61 @@ print(sorted(variants))
 
 ## Backend API
 
+### Deployment verification
+
+| Method and path (under `/api/v1/deployments`) | Permission | Result |
+| --- | --- | --- |
+| `POST /executions/{execution_id}/verifications` | `deployment:execution:connect` | `202`, persisted queued check |
+| `GET /executions/{execution_id}/verifications` | `deployment:run:read` | `{items: [...]}`, newest first, latest 20 |
+| `GET /executions/{execution_id}/verifications/{verification_id}` | `deployment:run:read` | One saved record, `404` if absent |
+
+All three enforce deployment resource scope. POST accepts `checks` (unique nonempty
+subset of `chat`, `prefix_cache`;
+default `["chat"]`) and strict integer `requests` (1–20, default 10). Prefix cache
+requires at least 10 total requests and consumes six of that budget. Invalid bodies
+return `422`; non-ready/model-less deployments or an active check return `409`.
+
+Records include `id`, `execution_id`, `request`, `status`
+(`queued|running|succeeded|failed`), timestamps, `requests_sent`,
+`requests_completed`, `requests_succeeded`, `output_tokens`, `max_output_tokens`,
+and, on completion, `verdict`, `evidence_sufficient` and `checks[].evidence`.
+Attempted requests count before HTTP dispatch; completed counts HTTP responses,
+not successful completions. No model response text or owner identity is exposed.
+Task completion and evidence verdict are separate. KV/rank/routing checks are not
+accepted for new tasks; older records remain readable. Zero or missing cache counters
+stay inconclusive. Observed chat failures are not masked by other transport errors.
+Each request times out after 10 seconds and the whole check after 120 seconds, after
+which it is marked failed and keeps the counters reached so far. Tasks left
+unfinished by a backend restart are marked failed at startup without replay; this
+assumes one Lens backend process, like Lens' other background tasks. Reads have no
+lifecycle side effects.
+The `prefix_cache` check shows that one model server reuses a repeated prompt prefix;
+it does not test llm-d prefix-aware routing. vLLM reports `cached_tokens` only when it
+runs with `--enable-prompt-tokens-details`; without that flag the verdict stays
+`inconclusive`.
+Records live in existing diagnostics JSON, survive stop/clean and disappear with
+execution history. Active checks register as deployment consumers.
+
+```python
+from llm_d_lens.deploy.verification import start_verification, get_verification
+from llm_d_lens.deploy.verification_checks import VerificationRequest
+
+# Inside an authorized async request/task on the Lens host:
+task = start_verification("execution-1", VerificationRequest(checks=["chat"], requests=2))
+saved = get_verification("execution-1", task["id"])  # persisted-only read
+```
+
+Service functions assume the caller has performed resource authorization; the
+public REST routes do so for both Web and MCP. No database migration is needed.
+
+Stop, clean, restart and delete operations check Deploy's registered usage probes
+before changing workloads or removing records. Active evaluation consumers and
+published model-service members block these operations with HTTP `409` and code
+`deployment_in_use`; unpublish members before teardown. Probe failures fail closed.
+Run deletion checks every case before starting cleanup. Python worker callers
+receive `deploy.usage.DeploymentInUseError` (a `ValueError`). These state checks
+do not reserve the deployment atomically against a concurrently starting consumer.
+
 Guide compatibility endpoints keep the `{ "error": "..." }` response shape.
 Expected validation failures retain their actionable message and status.
 Unexpected catalog/preparation failures return a generic `502` response; unexpected
@@ -880,6 +935,16 @@ Execution discovery is read-only and uses `execution_id` as its cross-module
 reference; listing does not start port-forwards. Use the execution endpoint
 action to obtain a host-reachable URL rather than assuming a persisted
 in-cluster endpoint or old tunnel is reachable.
+
+Execution list/detail REST responses additionally expose `run_id`, `case_id`,
+`ownership` (`self`, `other`, `unknown`) and `capabilities` (`update`, `stop`, `delete`).
+Capabilities are calculated for the authenticated caller using the same RBAC checks
+as writes; they are advisory and writes reauthorize. Owner user/group ids are not
+returned. Detail includes `configuration`, the exact source `DeployableConfiguration`
+selected by that case's `source_configuration_ordinal`, when the source run exists.
+It is the saved configuration, not a reconstruction of live manual scaling.
+The Python `ExecutionContext.api_payload()` remains a neutral runtime projection;
+the REST router adds caller-specific fields.
 
 | Record | Lifecycle states |
 | --- | --- |

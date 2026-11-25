@@ -7,8 +7,9 @@ Session directly. Design references: sections 5, 7 and 8.
 
 from __future__ import annotations
 
+import secrets
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 
 from llm_d_lens.auth.contracts import Principal
@@ -29,6 +30,7 @@ from llm_d_lens.auth.records import (
     AuditLogRecord,
     GroupRecord,
     GroupRoleBindingRecord,
+    PersonalAccessTokenRecord,
     RoleRecord,
     SessionRecord,
     UserGroupRecord,
@@ -55,6 +57,7 @@ from llm_d_lens.db.dao.audit_log import AuditLogDao
 from llm_d_lens.db.dao.group import GroupDao, GroupRoleBindingDao, UserGroupDao
 from llm_d_lens.db.dao.identity_provider import IdentityGroupMappingDao, IdentityProviderDao
 from llm_d_lens.db.dao.model_service_group import ModelServiceGroupDao
+from llm_d_lens.db.dao.personal_access_token import PersonalAccessTokenDao
 from llm_d_lens.db.dao.role import RoleDao, RolePermissionDao, UserRoleBindingDao
 from llm_d_lens.db.dao.session import SessionDao
 from llm_d_lens.db.dao.user import UserDao
@@ -126,6 +129,7 @@ class AuthService:
         self.settings = settings or get_settings()
         self.user_dao = user_dao or UserDao()
         self.session_dao = session_dao or SessionDao()
+        self.personal_token_dao = PersonalAccessTokenDao()
         self.audit_dao = audit_dao or AuditLogDao()
         self.user_group_dao = user_group_dao or UserGroupDao()
         self.group_dao = group_dao or GroupDao()
@@ -515,6 +519,8 @@ class AuthService:
     def validate(self, raw_token: str) -> Principal | None:
         if not raw_token:
             return None
+        if raw_token.startswith("lens-pat-"):
+            return self.validate_personal_token(raw_token)
         session = self.session_dao.get_by_token_hash(hash_session_token(raw_token))
         if session is None or session.revoked_at is not None:
             return None
@@ -570,6 +576,57 @@ class AuthService:
             self.audit("logout", target_type="user", target_id=session.user_id)
 
     # --- sessions ------------------------------------------------------------
+    def create_personal_token(
+        self, principal: Principal, name: str, expires_in_days: int
+    ) -> tuple[PersonalAccessTokenRecord, str]:
+        if principal.credential_type != "session":
+            raise ForbiddenError("a login session is required to manage credentials")
+        user = self.user_dao.get(principal.user_id)
+        if user is None or user.status != "active" or user.must_change_password:
+            raise ForbiddenError("an active account with a completed password change is required")
+        name = name.strip()
+        if not name or len(name) > 100 or type(expires_in_days) is not int or not 1 <= expires_in_days <= 365:
+            raise DomainValidationError("name must contain 1-100 characters and expiry must be 1-365 days")
+        raw = "lens-pat-" + secrets.token_urlsafe(32)
+        record = self.personal_token_dao.create(
+            PersonalAccessTokenRecord(
+                user_id=user.id,
+                name=name,
+                token_prefix=raw[:16],
+                token_hash=hash_session_token(raw),
+                expires_at=utcnow() + timedelta(days=expires_in_days),
+            )
+        )
+        self.audit("personal_token_created", actor=user, target_type="personal_access_token", target_id=record.id)
+        return record, raw
+
+    def validate_personal_token(self, raw: str) -> Principal | None:
+        record = self.personal_token_dao.get_by_hash(hash_session_token(raw))
+        now = utcnow()
+        if record is None or record.revoked_at is not None or record.expires_at <= now:
+            return None
+        user = self.user_dao.get(record.user_id)
+        if user is None or user.status != "active" or user.must_change_password:
+            return None
+        if user.password_changed_at and record.created_at <= user.password_changed_at:
+            return None
+        if record.last_used_at is None or (now - record.last_used_at).total_seconds() >= 60:
+            self.personal_token_dao.touch(record.id, now)
+        return replace(self.principal_for(user), credential_type="personal_access_token")
+
+    def revoke_personal_token(self, principal: Principal, token_id: str) -> None:
+        if principal.credential_type != "session":
+            raise ForbiddenError("a login session is required to manage credentials")
+        if not self.personal_token_dao.revoke(token_id, principal.user_id):
+            raise NotFoundError("personal access token not found")
+        self.audit(
+            "personal_token_revoked",
+            actor_user_id=principal.user_id,
+            actor_username=principal.username,
+            target_type="personal_access_token",
+            target_id=token_id,
+        )
+
     def list_sessions(self, user_id: str, *, include_revoked: bool = False) -> list[SessionRecord]:
         return self.session_dao.list_for_user(user_id, include_revoked=include_revoked)
 
@@ -620,6 +677,7 @@ class AuthService:
             if session is not None and session.user_id == user_id:
                 keep_session_id = session.id
         self.session_dao.revoke_user_sessions(user_id, keep_session_id=keep_session_id)
+        self.personal_token_dao.revoke_for_user(user_id)
         self.audit("password_changed", actor=user)
 
     # --- bootstrap & built-in roles -----------------------------------------
@@ -696,6 +754,7 @@ class AuthService:
         saved = self.user_dao.save(user)
         if saved.status != "active":
             self.session_dao.revoke_user_sessions(user_id)
+            self.personal_token_dao.revoke_for_user(user_id)
         self.audit("user_updated", target_type="user", target_id=user_id, detail={"fields": sorted(updates)})
         return saved
 
@@ -731,6 +790,7 @@ class AuthService:
         self.user_dao.save(user)
         self.session_dao.revoke_user_sessions(user_id)
         self.audit("password_reset", target_type="user", target_id=user_id)
+        self.personal_token_dao.revoke_for_user(user_id)
 
     def _guard_last_admin(self, user_id: str) -> None:
         admin_role = self.role_dao.get_by_name(BUILTIN_ROLE_ADMIN)

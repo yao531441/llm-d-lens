@@ -12,6 +12,36 @@ Administration spans the auth router in `llm_d_lens/auth/router.py` and the syst
 
 Auth and administration routes live under the `/api/v1` prefix from `llm_d_lens/auth/router.py`.
 
+### Personal access tokens
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+
+All three endpoints require a normal login session; browser mutations require CSRF.
+`GET /api/v1/auth/access-tokens` returns only the caller's token metadata.
+`POST /api/v1/auth/access-tokens` accepts `{"name":"MCP","expiresInDays":30}`
+(nonblank name up to 100 characters; integer lifetime 1–365 days, default 30).
+It returns HTTP 201 with metadata and one-time `token`, with `Cache-Control: no-store`.
+`DELETE /api/v1/auth/access-tokens/{token_id}` returns 204, including on repeated
+revocation; missing or another user's IDs return 404.
+
+Metadata fields are `id`, `user_id`, `name`, `token_prefix`, `created_at`, `expires_at`,
+`last_used_at`, and `revoked_at`. Hashes and plaintext are absent from list responses.
+PAT Bearer authentication inherits live user RBAC, but cannot manage credentials.
+Invalid, expired or revoked PATs return 401; credential management with a PAT returns 403.
+PATs are not accepted as session cookies.
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+
+`AuthService.create_personal_token(principal, name, expires_in_days)` returns
+`(PersonalAccessTokenRecord, plaintext)` for an active user with a session principal.
+`validate_personal_token(plaintext)` returns a current restricted principal or `None`.
+`revoke_personal_token(principal, token_id)` enforces session identity and token ownership.
+These service methods are for already-authorized application code. Public metadata
+serialization must exclude `token_hash`; plaintext must never be persisted or logged.
+  </TabItem>
+</Tabs>
+
 ### Resource binding restrictions
 
 Model inference grants replace deployment sharing. Resource-scope bindings only

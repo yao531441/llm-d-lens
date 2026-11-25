@@ -18,6 +18,7 @@ from llm_d_lens.deploy.contracts import (
 )
 from llm_d_lens.deploy.run_store import JsonDeploymentRunStore
 from llm_d_lens.deploy.service import DeploymentCreationCancelled, DeploymentService
+from llm_d_lens.deploy.usage import require_unused
 
 logger = logging.getLogger(__name__)
 
@@ -325,6 +326,7 @@ class DeploymentRunWorker:
     async def stop_case(self, run_id: str, case_id: str):
         self._require_active_cluster_session()
         run, case, execution = self._case_execution(run_id, case_id)
+        require_unused(execution.execution_id)
         stopped = await self._service.stop(execution)
         self._store.save_execution(stopped)
         case.status = DeploymentCaseStatus.STOPPED
@@ -336,6 +338,7 @@ class DeploymentRunWorker:
         run, case, execution = self._case_execution(run_id, case_id)
         if case.status in {DeploymentCaseStatus.CLEANED, DeploymentCaseStatus.CLEANED_UP}:
             raise ValueError("deployment case is already cleaned")
+        require_unused(execution.execution_id)
         cleaned = await self._service.clean(execution, preserve_rendered_overlay=preserve_rendered_overlay)
         self._store.save_execution(cleaned)
         if cleaned.status == DeploymentStatus.CLEANED:
@@ -355,6 +358,7 @@ class DeploymentRunWorker:
             raise ValueError("only stopped or failed deployment cases can be restarted")
         if run.provenance.get("_prepared_plan_id"):
             raise ValueError("Prepared deployments require a new reviewed plan before restart")
+        require_unused(execution.execution_id)
         cleaned = await self._service.clean(execution)
         self._store.save_execution(cleaned)
         run = self._store.get_run(run_id)
@@ -403,6 +407,11 @@ class DeploymentRunWorker:
         if run.status in {DeploymentRunStatus.QUEUED, DeploymentRunStatus.RUNNING, DeploymentRunStatus.CANCELLING}:
             raise ValueError("active deployment run must be stopped or cleaned before deletion")
         execution_ids = [case.execution_id for case in run.cases]
+        # Check the whole run before cleaning anything, including references whose
+        # execution records are already gone or cleaned.
+        for execution_id in execution_ids:
+            if execution_id:
+                require_unused(execution_id)
         for case in run.cases:
             if case.execution_id is None or case.status in {
                 DeploymentCaseStatus.CLEANED,
@@ -439,6 +448,8 @@ class DeploymentRunWorker:
         case = self._store.get_case(run_id, case_id)
         if run is None or case is None:
             raise ValueError("deployment case not found")
+        if case.execution_id:
+            require_unused(case.execution_id)
         if run.status in {
             DeploymentRunStatus.QUEUED,
             DeploymentRunStatus.RUNNING,

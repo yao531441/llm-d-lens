@@ -19,7 +19,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import yaml
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 
 from llm_d_lens.auth.access import (
     current_principal,
@@ -43,8 +43,9 @@ from llm_d_lens.deploy.contracts import (
     RuntimeBinding,
 )
 from llm_d_lens.deploy.data_plane import deployment_uses_shared_gateway
-from llm_d_lens.deploy.usage import register_usage_probe
+from llm_d_lens.deploy.usage import exempt_usage, register_usage_probe
 from llm_d_lens.evaluation.api_models import (
+    BenchmarkArtifactListResponse,
     BenchmarkDefaultsResponse,
     BenchmarkRunListResponse,
     BenchmarkRunResponse,
@@ -56,6 +57,7 @@ from llm_d_lens.evaluation.api_models import (
     evaluation_problem_responses,
 )
 from llm_d_lens.evaluation.benchmark_evidence import (
+    LIFECYCLE_ARTIFACT_NAME,
     capture_benchmark_context,
     ingest_evaluate_run,
     read_lifecycle_artifact,
@@ -230,7 +232,7 @@ def _baseline_key(configuration: DeployableConfiguration, benchmark: dict) -> st
     return configuration_checksum(payload)
 
 
-def _baseline_configuration(
+def baseline_configuration(
     source: DeployableConfiguration,
     baseline_type: str,
     workload_ids: list[str],
@@ -2185,7 +2187,10 @@ def _deployment_cleanup_guard(execution_id: str):
         if not acquired:
             raise ValueError("Deployment still has an active benchmark; cleanup deferred")
         _ensure_benchmark_consumers_finished(execution_id)
-        yield
+        # The case that is being cleaned up is still unfinished here when it failed by exception, so
+        # the evaluate usage probe would block its own cleanup. Other consumers still apply.
+        with exempt_usage("evaluate"):
+            yield
 
 
 def _ensure_benchmark_consumers_finished(execution_id: str) -> None:
@@ -4285,7 +4290,7 @@ async def create_evaluation(request: EvaluationCreateRequest, http_request: Requ
         source_artifact_id = source_plan.configuration_artifact_id
         source_artifact = artifacts[source_artifact_id]
         try:
-            baseline = _baseline_configuration(
+            baseline = baseline_configuration(
                 source_artifact.deployable_configuration,
                 case.get("baseline_type", "direct-vllm"),
                 case["workload_ids"],
@@ -4566,7 +4571,12 @@ async def _cancel_evaluation(workflow: dict, case_id: str | None = None) -> dict
         errors = []
         for deployment_id in deployment_ids:
             try:
-                await deployment_run_manager.worker_for_run(deployment_id).cancel_evaluation_deployment(deployment_id)
+                # The cancelling cases and runs are still unfinished here and would make the evaluate
+                # usage probe block the very cleanup this cancellation performs.
+                with exempt_usage("evaluate"):
+                    await deployment_run_manager.worker_for_run(deployment_id).cancel_evaluation_deployment(
+                        deployment_id
+                    )
             except Exception as error:
                 errors.append(f"{deployment_id}: {error}")
         for case in targets:
@@ -4899,6 +4909,96 @@ async def get_run(run_id: str, request: Request = None) -> dict:
     if changed:
         _save(run)
     return _benchmark_response(run)
+
+
+def _artifact_directories(run: dict) -> dict[str, Path]:
+    """Report directories of a run: ``""`` for its own report and ``matrix-N`` for each matrix point."""
+    directories = {}
+    own = (run.get("metrics") or {}).get("summary_path")
+    if isinstance(own, str):
+        directories[""] = Path(own).parent
+    for index, point in enumerate(run.get("matrix_results") or []):
+        summary = (point.get("metrics") or {}).get("summary_path")
+        if isinstance(summary, str):
+            directories[f"matrix-{index}"] = Path(summary).parent
+    return directories
+
+
+def _readable_benchmark_run(run_id: str, request: Request) -> dict:
+    try:
+        run = _get("benchmark", run_id)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if run is None:
+        raise HTTPException(status_code=404, detail="evaluate run not found")
+    _require_evaluate_record(
+        current_principal(request),
+        run,
+        permission="evaluate:run:read",
+        resource_type="evaluate_run",
+        detail="evaluate run is not accessible",
+    )
+    return run
+
+
+@router.get(
+    "/runs/{run_id}/artifacts",
+    summary="List the native benchmark reports saved for a run.",
+    description=(
+        "List the lifecycle reports the benchmark harness saved for this run: summary, per-stage and per-request "
+        "files and the harness config. Matrix runs prefix each point's files with matrix-N/. Reports kept only in a "
+        "workspace archive are not listed individually; their directories appear in archived_in and the standard "
+        "names can still be downloaded."
+    ),
+    operation_id="list_evaluate_run_artifacts",
+    responses=evaluation_problem_responses(401, 403, 404, 422),
+    response_model=BenchmarkArtifactListResponse,
+)
+async def list_run_artifacts(run_id: str, request: Request = None) -> dict:
+    run = _readable_benchmark_run(run_id, request)
+    items = []
+    archived_in = []
+    for prefix, directory in _artifact_directories(run).items():
+        for path in sorted(directory.glob("*")):
+            if path.is_file() and LIFECYCLE_ARTIFACT_NAME.fullmatch(path.name):
+                items.append(
+                    {"name": f"{prefix}/{path.name}" if prefix else path.name, "size_bytes": path.stat().st_size}
+                )
+        if (directory / "workspace.tar.zst").is_file():
+            archived_in.append(prefix or ".")
+    return {"items": items, "archived_in": archived_in}
+
+
+@router.get(
+    "/runs/{run_id}/artifacts/{name:path}",
+    summary="Download one native benchmark report of a run.",
+    description=(
+        "Return the raw report bytes, for example per_request_lifecycle_metrics.json for the individual request "
+        "records of a run. Files up to 64 MiB are served, from the loose file or the run's workspace archive. Names "
+        "outside the lifecycle report set return 422; a report that was not saved or cannot be read returns 404."
+    ),
+    operation_id="get_evaluate_run_artifact",
+    responses={
+        **evaluation_problem_responses(401, 403, 404, 422),
+        200: {"content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}}},
+    },
+    response_class=Response,
+)
+async def get_run_artifact(run_id: str, name: str, request: Request = None) -> Response:
+    run = _readable_benchmark_run(run_id, request)
+    prefix, _, filename = name.rpartition("/")
+    if not LIFECYCLE_ARTIFACT_NAME.fullmatch(filename):
+        raise HTTPException(status_code=422, detail="name is not a benchmark report")
+    directory = _artifact_directories(run).get(prefix)
+    if directory is None:
+        raise HTTPException(status_code=404, detail="evaluate run has no reports at this path")
+    try:
+        content = read_lifecycle_artifact(directory / "summary_lifecycle_metrics.json", filename)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=f"report is not readable: {error}") from error
+    if content is None:
+        raise HTTPException(status_code=404, detail="report was not saved for this run")
+    return Response(content, media_type="application/yaml" if filename.endswith(".yaml") else "application/json")
 
 
 @router.get(

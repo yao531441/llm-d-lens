@@ -750,6 +750,94 @@ Probe the cluster's Kubernetes API for reachability and its server version, and 
   </TabItem>
 </Tabs>
 
+### Get cluster PCIe-root topology
+
+Group the cluster's DRA devices into PCIe roots per node. A tensor-parallel group needs whole roots, so free capacity is reported per root: all GPUs unallocated and, for hardware with RDMA NICs, the NIC still available. Monitoring (admin-access) claims are ignored. Hardware profiles without a `placement` block return `409 topology_unsupported`.
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`GET /api/cluster/clusters/{cluster_id}/topology`**
+
+    ```json
+    {
+      "profile": "intel-xpu",
+      "gpusPerRoot": 2,
+      "requiresNic": true,
+      "nodes": [
+        {
+          "name": "smc-18",
+          "ready": true,
+          "schedulable": true,
+          "freeRoots": 3,
+          "busyGpus": 2,
+          "roots": [
+            {"root": "pci0000:37", "gpus": ["0000-37-00-0-0xe211"], "nics": ["pci-0000-31-00-0"], "numa": 0, "busyGpus": 0, "free": true}
+          ]
+        }
+      ]
+    }
+    ```
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    from llm_d_lens.cluster import registry, service
+
+    topology = await service.get_topology(registry.require_cluster("cluster-a"))
+    print([(node["name"], node["freeRoots"]) for node in topology["nodes"]])
+    ```
+  </TabItem>
+</Tabs>
+
+### Probe whole-root placement
+
+Check whether roles such as prefill and decode can be placed on whole free PCIe roots now. Each replica takes `tensorParallelSize / gpusPerRoot` free roots on one node; `roleNodesDisjoint` requires different roles to use different nodes. The answer is advisory because capacity can change before the deployment is created.
+
+<Tabs>
+  <TabItem value="rest-api" label="REST API">
+    **`POST /api/cluster/clusters/{cluster_id}/placement/probe`**
+
+    ```json
+    {
+      "roles": [
+        {"name": "prefill", "replicas": 1, "tensorParallelSize": 4},
+        {"name": "decode", "replicas": 1, "tensorParallelSize": 4}
+      ],
+      "roleNodesDisjoint": true,
+      "excludeNodes": []
+    }
+    ```
+
+    Response:
+
+    ```json
+    {
+      "fits": true,
+      "assignment": {"prefill": {"smc-19": 1}, "decode": {"smc-20": 1}},
+      "reasons": [],
+      "freeRoots": {"smc-18": 3, "smc-19": 4, "smc-20": 4},
+      "unusableNodes": []
+    }
+    ```
+
+    When `fits` is false, `assignment` is empty and `reasons` explains why (not enough whole roots, tensor-parallel size not a multiple of the GPUs per root, or roles that fit separately but not together).
+  </TabItem>
+  <TabItem value="python-api" label="Python API">
+    ```python
+    from llm_d_lens.cluster import registry, service
+
+    plan = await service.probe_placement(
+        registry.require_cluster("cluster-a"),
+        [
+            {"name": "prefill", "replicas": 1, "tensorParallelSize": 4},
+            {"name": "decode", "replicas": 1, "tensorParallelSize": 4},
+        ],
+        role_nodes_disjoint=True,
+    )
+    print(plan["fits"], plan["assignment"] or plan["reasons"])
+    ```
+  </TabItem>
+</Tabs>
+
 ### Delete a cluster
 
 Delete a Lens-managed cluster record and clean up related state. This should only be used when the cluster should be removed from Lens entirely.

@@ -367,6 +367,37 @@ class PlanningContribution:
 
 
 @dataclass(frozen=True)
+class PlacementContribution:
+    """How DRA ResourceSlices expose PCIe-root topology for whole-root placement.
+
+    A TP group is made of whole PCIe roots: every accelerator on the root plus, when ``nic_driver`` is set, one
+    RDMA NIC on that root. Hardware without this contribution reports capacity totals only.
+    """
+
+    root_attribute: str
+    nic_driver: str | None = None
+    nic_rdma_attribute: str | None = None
+    nic_numa_attribute: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> PlacementContribution:
+        return cls(
+            root_attribute=str(data["root_attribute"]),
+            nic_driver=data.get("nic_driver"),
+            nic_rdma_attribute=data.get("nic_rdma_attribute"),
+            nic_numa_attribute=data.get("nic_numa_attribute"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "root_attribute": self.root_attribute,
+            "nic_driver": self.nic_driver,
+            "nic_rdma_attribute": self.nic_rdma_attribute,
+            "nic_numa_attribute": self.nic_numa_attribute,
+        }
+
+
+@dataclass(frozen=True)
 class UiContribution:
     """Presentation metadata for the browser client."""
 
@@ -405,6 +436,7 @@ class HardwareProfile:
     telemetry: TelemetryContribution | None = None
     evaluation_profile: str = ""
     planning: PlanningContribution = field(default_factory=PlanningContribution)
+    placement: PlacementContribution | None = None
     ui: UiContribution = field(default_factory=UiContribution)
 
     @classmethod
@@ -412,6 +444,7 @@ class HardwareProfile:
         driver = data.get("driver")
         presence = data.get("presence")
         telemetry = data.get("telemetry")
+        placement = data.get("placement")
         return cls(
             id=str(data["id"]),
             display_name=str(data.get("display_name") or data["id"]),
@@ -433,6 +466,7 @@ class HardwareProfile:
             telemetry=TelemetryContribution.from_dict(telemetry) if telemetry else None,
             evaluation_profile=str(data.get("evaluation_profile") or data.get("benchmark_profile") or ""),
             planning=PlanningContribution.from_dict(data.get("planning") or {}),
+            placement=PlacementContribution.from_dict(placement) if placement else None,
             ui=UiContribution.from_dict(data.get("ui") or {}),
         )
 
@@ -465,6 +499,7 @@ class HardwareProfile:
             "deployment": self.deployment.to_dict(),
             "evaluation_profile": self.evaluation_profile,
             "planning": self.planning.to_dict(),
+            "placement": self.placement.to_dict() if self.placement else None,
             "ui": self.ui.to_dict(),
         }
 

@@ -11,6 +11,8 @@ import re
 import shutil
 import tempfile
 import time
+from collections import Counter
+from functools import cache
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -2243,3 +2245,248 @@ async def build_overview(cluster: registry.Cluster) -> dict[str, Any]:
             device_metrics=device_metrics,
         ),
     }
+
+
+# --- PCIe-root topology and placement ---
+
+
+def _slice_attribute(device: dict[str, Any], name: str | None) -> Any:
+    """Value of a DRA device attribute; DRA wraps it as ``{"string": ...}``, ``{"bool": ...}`` or ``{"int": ...}``."""
+    value = (device.get("attributes") or {}).get(name or "")
+    return next(iter(value.values()), None) if value else None
+
+
+def build_topology(
+    nodes: list[dict[str, Any]], slices: list[dict[str, Any]], claims: list[dict[str, Any]], profile: Any
+) -> dict[str, Any]:
+    """Group a cluster's DRA devices into PCIe roots and mark which roots are entirely free.
+
+    A root is free when it has the usual number of GPUs (the most common count, so a root with missing devices is
+    never counted), none of its GPUs is allocated and, if the profile declares RDMA NICs, an unallocated NIC is
+    still published on it (the NIC driver removes allocated NICs from its ResourceSlice). Admin-access claims, used
+    by monitoring, do not take devices exclusively and are ignored.
+    """
+    placement = profile.placement
+    gpu_drivers = set(profile.device_classes)
+    # DRA pool names are usually the node name, so a GPU and a NIC driver can publish the same (pool, device).
+    allocated = {
+        (str(result.get("driver")), str(result.get("pool")), str(result.get("device")))
+        for claim in claims
+        for result in (
+            (((claim.get("status") or {}).get("allocation") or {}).get("devices") or {}).get("results") or []
+        )
+        if not result.get("adminAccess", False)
+    }
+    roots: dict[str, dict[str, dict[str, Any]]] = {}
+    for item in slices:
+        spec = item.get("spec") or {}
+        driver = spec.get("driver")
+        is_gpu = driver in gpu_drivers
+        if not (is_gpu or (placement.nic_driver and driver == placement.nic_driver)):
+            continue
+        node = str(spec.get("nodeName") or "")
+        pool = str((spec.get("pool") or {}).get("name") or node)
+        for device in spec.get("devices") or []:
+            root_id = _slice_attribute(device, placement.root_attribute)
+            if not node or root_id is None:
+                continue
+            if not is_gpu and _slice_attribute(device, placement.nic_rdma_attribute) is not True:
+                continue
+            root = roots.setdefault(node, {}).setdefault(
+                str(root_id), {"root": str(root_id), "gpus": [], "nics": [], "numa": None, "busyGpus": 0}
+            )
+            name = str(device.get("name"))
+            busy = (str(driver), pool, name) in allocated
+            if is_gpu:
+                root["gpus"].append(name)
+                root["busyGpus"] += int(busy)
+            elif not busy:
+                root["nics"].append(name)
+                numa = _slice_attribute(device, placement.nic_numa_attribute)
+                root["numa"] = int(numa) if numa is not None else None
+
+    gpu_counts = Counter(
+        len(root["gpus"]) for node_roots in roots.values() for root in node_roots.values() if root["gpus"]
+    )
+    gpus_per_root = gpu_counts.most_common(1)[0][0] if gpu_counts else 0
+    result_nodes = []
+    for node in sorted(nodes, key=lambda item: str((item.get("metadata") or {}).get("name"))):
+        name = str((node.get("metadata") or {}).get("name"))
+        if name not in roots:
+            continue
+        conditions = {c.get("type"): c.get("status") for c in (node.get("status") or {}).get("conditions") or []}
+        node_roots = sorted(roots[name].values(), key=lambda root: root["root"])
+        for root in node_roots:
+            root["free"] = (
+                len(root["gpus"]) == gpus_per_root
+                and root["busyGpus"] == 0
+                and (not placement.nic_driver or bool(root["nics"]))
+            )
+        result_nodes.append(
+            {
+                "name": name,
+                "ready": conditions.get("Ready") == "True",
+                "schedulable": not (node.get("spec") or {}).get("unschedulable", False),
+                "roots": node_roots,
+                "freeRoots": sum(root["free"] for root in node_roots),
+                "busyGpus": sum(root["busyGpus"] for root in node_roots),
+            }
+        )
+    return {
+        "profile": profile.id,
+        "gpusPerRoot": gpus_per_root,
+        "requiresNic": bool(placement.nic_driver),
+        "nodes": result_nodes,
+    }
+
+
+async def get_topology(cluster: registry.Cluster) -> dict[str, Any]:
+    """Live PCIe-root topology of a cluster, read with the placement profile of the accelerators it publishes."""
+    profiles = [item for item in _hardware_profiles() if item.placement]
+    if not profiles:
+        raise ClusterOverviewError(
+            "No registered hardware profile publishes PCIe-root topology", status_code=409, code="topology_unsupported"
+        )
+    commands = (
+        ("nodes", ["get", "nodes", "-o", "json"]),
+        ("resource slices", ["get", "resourceslices.resource.k8s.io", "-o", "json"]),
+        ("resource claims", ["get", "resourceclaims.resource.k8s.io", "-A", "-o", "json"]),
+    )
+    results = await asyncio.gather(*(run_kubectl(argv, cluster_id=cluster.id, timeout=30) for _, argv in commands))
+    nodes, slices, claims = (
+        json_output(result, f"kubectl get {label}").get("items") or []
+        for result, (label, _) in zip(results, commands, strict=True)
+    )
+    drivers = {(item.get("spec") or {}).get("driver") for item in slices}
+    profile = next((item for item in profiles if drivers & set(item.device_classes)), None)
+    if profile is None:
+        raise ClusterOverviewError(
+            "This cluster publishes no accelerators of a hardware profile that declares PCIe-root topology",
+            status_code=409,
+            code="topology_unsupported",
+        )
+    return build_topology(nodes, slices, claims, profile)
+
+
+def plan_placement(
+    topology: dict[str, Any],
+    roles: list[dict[str, Any]],
+    *,
+    role_nodes_disjoint: bool = False,
+    exclude_nodes: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Place every replica of every role on whole free PCIe roots of one node.
+
+    A pod of ``tensorParallelSize`` GPUs needs ``tensorParallelSize / gpusPerRoot`` whole free roots on one node.
+    The result is advisory: capacity can change between the probe and the deployment. Returns ``fits``, the pods
+    per node for each role, and otherwise the reasons the topology does not fit.
+    """
+    nodes = topology["nodes"]
+    usable = [node for node in nodes if node["ready"] and node["schedulable"] and node["name"] not in exclude_nodes]
+    plan: dict[str, Any] = {
+        "fits": False,
+        "assignment": {},
+        "reasons": [],
+        "freeRoots": {node["name"]: node["freeRoots"] for node in nodes},
+        "unusableNodes": [node["name"] for node in nodes if node not in usable],
+    }
+    gpus_per_root = topology["gpusPerRoot"]
+    roots_per_pod: dict[str, int] = {}
+    for role in roles:
+        tp = role["tensorParallelSize"]
+        if not gpus_per_root or tp % gpus_per_root:
+            plan["reasons"].append(
+                f"{role['name']}: tensorParallelSize={tp} is not a multiple of {gpus_per_root} GPUs per root"
+            )
+        else:
+            roots_per_pod[role["name"]] = tp // gpus_per_root
+    if plan["reasons"]:
+        return plan
+    capacity = {
+        role["name"]: {node["name"]: node["freeRoots"] // roots_per_pod[role["name"]] for node in usable}
+        for role in roles
+    }
+    for role in roles:
+        hosted = sum(capacity[role["name"]].values())
+        if hosted < role["replicas"]:
+            plan["reasons"].append(
+                f"{role['name']}: needs {role['replicas']} pod(s) x {roots_per_pod[role['name']]} whole root(s), "
+                f"but usable nodes can host {hosted}"
+            )
+    if plan["reasons"]:
+        return plan
+    if role_nodes_disjoint:
+        placed = _assign_disjoint(usable, roles, capacity)
+    else:
+        placed = _assign_shared(usable, roles, roots_per_pod)
+    if placed is None:
+        plan["reasons"].append(
+            "No placement was found for all roles together"
+            + (" on disjoint nodes" if role_nodes_disjoint else " (the search for shared nodes is greedy)")
+        )
+        return plan
+    plan["fits"] = True
+    for role_name, node_name, pods in placed:
+        plan["assignment"].setdefault(role_name, {})[node_name] = pods
+    return plan
+
+
+def _assign_disjoint(
+    usable: list[dict[str, Any]], roles: list[dict[str, Any]], capacity: dict[str, dict[str, int]]
+) -> tuple[tuple[str, str, int], ...] | None:
+    """Give each node to at most one role; prefer idle nodes, then fewer nodes, then less fragmentation."""
+    names = [role["name"] for role in roles]
+
+    @cache
+    def best(
+        index: int, remaining: tuple[int, ...]
+    ) -> tuple[tuple[int, int, int], tuple[tuple[str, str, int], ...]] | None:
+        if not any(remaining):
+            return (0, 0, 0), ()
+        if index == len(usable):
+            return None
+        node = usable[index]
+        options = [best(index + 1, remaining)]
+        for position, role_name in enumerate(names):
+            pods = min(remaining[position], capacity[role_name][node["name"]])
+            if pods == 0:
+                continue
+            rest = best(index + 1, remaining[:position] + (remaining[position] - pods,) + remaining[position + 1 :])
+            if rest is not None:
+                cost = (rest[0][0] + node["busyGpus"], rest[0][1] + 1, rest[0][2] + node["freeRoots"])
+                options.append((cost, ((role_name, node["name"], pods), *rest[1])))
+        return min((option for option in options if option is not None), default=None)
+
+    found = best(0, tuple(role["replicas"] for role in roles))
+    return found[1] if found else None
+
+
+def _assign_shared(
+    usable: list[dict[str, Any]], roles: list[dict[str, Any]], roots_per_pod: dict[str, int]
+) -> tuple[tuple[str, str, int], ...] | None:
+    """Best-fit pod by pod, largest pods first, preferring idle nodes and the tightest fit."""
+    left = {node["name"]: node["freeRoots"] for node in usable}
+    busy = {node["name"]: node["busyGpus"] for node in usable}
+    counts: dict[tuple[str, str], int] = {}
+    for role in sorted(roles, key=lambda item: -roots_per_pod[item["name"]]):
+        need = roots_per_pod[role["name"]]
+        for _ in range(role["replicas"]):
+            candidates = [name for name in left if left[name] >= need]
+            if not candidates:
+                return None
+            chosen = min(candidates, key=lambda name: (busy[name], left[name]))
+            left[chosen] -= need
+            counts[(role["name"], chosen)] = counts.get((role["name"], chosen), 0) + 1
+    return tuple((role_name, node_name, pods) for (role_name, node_name), pods in counts.items())
+
+
+async def probe_placement(
+    cluster: registry.Cluster,
+    roles: list[dict[str, Any]],
+    *,
+    role_nodes_disjoint: bool = False,
+    exclude_nodes: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Can these roles be placed on whole free PCIe roots right now."""
+    topology = await get_topology(cluster)
+    return plan_placement(topology, roles, role_nodes_disjoint=role_nodes_disjoint, exclude_nodes=exclude_nodes)

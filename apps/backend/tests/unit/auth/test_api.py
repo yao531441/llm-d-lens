@@ -868,3 +868,11 @@ def test_audit_update_events_are_suppressed_for_high_frequency_workloads():
         assert audit_tracks_write(table, "delete")
 
     assert audit_tracks_write("clusters", "update")
+
+
+def test_matrix_artifact_names_with_a_slash_are_routed_through_authorization():
+    with _client() as client:
+        _bootstrap_and_login(client)
+        run_id = "00000000-0000-4000-8000-000000000000"
+        # 404 comes from the handler; an unregistered route would be refused here with 403.
+        assert client.get(f"/api/v1/evaluate/runs/{run_id}/artifacts/matrix-0/config.yaml").status_code == 404

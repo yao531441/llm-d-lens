@@ -133,6 +133,11 @@ class LoginRequest(BaseModel):
     remember: bool = False
 
 
+class PersonalTokenRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    expires_in_days: int = Field(default=30, alias="expiresInDays", strict=True, ge=1, le=365)
+
+
 class BootstrapRequest(BaseModel):
     username: str
     password: str
@@ -304,6 +309,32 @@ async def permission_catalog() -> list[dict[str, Any]]:
         {"code": p.code, "domain": p.domain, "description": p.description, "risk": p.risk}
         for p in sorted(ALL_PERMISSIONS.values(), key=lambda permission: permission.code)
     ]
+
+
+def _personal_token_public(record) -> dict[str, Any]:
+    data = _jsonify(record)
+    data.pop("token_hash", None)
+    return data
+
+
+@router.get("/auth/access-tokens")
+async def list_personal_tokens(request: Request) -> list[dict[str, Any]]:
+    return [
+        _personal_token_public(record)
+        for record in default_service().personal_token_dao.list_for_user(_principal(request).user_id)
+    ]
+
+
+@router.post("/auth/access-tokens", status_code=201)
+async def create_personal_token(body: PersonalTokenRequest, request: Request, response: Response) -> dict[str, Any]:
+    record, raw = default_service().create_personal_token(_principal(request), body.name, body.expires_in_days)
+    response.headers["Cache-Control"] = "no-store"
+    return {**_personal_token_public(record), "token": raw}
+
+
+@router.delete("/auth/access-tokens/{token_id}", status_code=204)
+async def revoke_personal_token(token_id: str, request: Request) -> None:
+    default_service().revoke_personal_token(_principal(request), token_id)
 
 
 @router.post("/auth/bootstrap")

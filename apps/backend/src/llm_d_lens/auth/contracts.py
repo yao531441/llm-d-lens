@@ -68,6 +68,7 @@ class Principal:
     group_ids: frozenset[str] = frozenset()
     authz_version: int = 1
     must_change_password: bool = False
+    credential_type: str = "session"
 
     def is_global_admin(self) -> bool:
         """True when the principal holds the admin role at global scope."""
