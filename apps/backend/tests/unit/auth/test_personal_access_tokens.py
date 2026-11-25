@@ -2,6 +2,7 @@
 
 from contextlib import closing
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -54,6 +55,36 @@ def test_hash_only_stable_identity_and_owner_revocation(browser):
         assert browser.delete(f"/api/v1/auth/access-tokens/{stored.id}").status_code == 204
         assert api.get("/api/v1/auth/session").status_code == 401
     assert browser.get("/api/v1/auth/session").status_code == 200
+
+
+@pytest.mark.parametrize(
+    "method,path,body",
+    [
+        ("GET", "/api/v1/auth/access-tokens", None),
+        ("POST", "/api/v1/auth/access-tokens", {"name": "nested"}),
+        ("DELETE", "/api/v1/auth/access-tokens/arbitrary", None),
+        ("GET", "/api/v1/sessions", None),
+        ("POST", "/api/v1/auth/password", {"oldPassword": PASSWORD, "newPassword": "Another-Strong-7!"}),
+        ("POST", "/api/v1/users/any/password", {"newPassword": "Another-Strong-7!"}),
+        ("GET", "/api/v1/model-service/tokens", None),
+        ("GET", "/api/v1/system/secret-key", None),
+        ("PUT", "/api/v1/ai-providers/any", {"apiKey": "synthetic-key"}),
+        ("POST", "/api/v1/users", {"username": "nested", "password": PASSWORD}),
+    ],
+)
+def test_pat_cannot_manage_credentials_even_through_signed_mcp(browser, method, path, body):
+    from llm_d_lens.mcp.lens_api import AsgiLensApi
+
+    issued = issue(browser)
+    principal = default_service().validate(issued["token"])
+    request = SimpleNamespace(
+        headers={"authorization": f"Bearer {issued['token']}"}, state=SimpleNamespace(principal=principal)
+    )
+    headers = AsgiLensApi(request)._headers(method, path)
+    assert headers.get("x-prism-internal-sig")
+    with closing(TestClient(app, base_url="https://testserver")) as api:
+        response = api.request(method, path, headers=headers, json=body)
+        assert response.status_code == 403, response.text
 
 
 def _signed(path, *, method="GET", source=None):
@@ -186,6 +217,26 @@ def test_account_and_expiry_lifecycle(browser, action, monkeypatch):
     else:
         monkeypatch.setattr("llm_d_lens.auth.service.utcnow", lambda: utcnow() + timedelta(days=2))
     assert service.validate(raw) is None
+
+
+def test_pat_redacted_from_mcp_output_and_arguments():
+    from llm_d_lens.mcp.safety import find_secret, redact
+
+    raw = "lens-pat-" + "a" * 43
+    assert find_secret({"name": raw}) == "name"
+    assert redact({"log": raw}) == {"log": "***"}
+
+
+def test_personal_token_authenticates_both_mcp_endpoints(browser):
+    issued = issue(browser)
+    with closing(TestClient(app, base_url="https://testserver")) as api:
+        headers = {"Authorization": f"Bearer {issued['token']}", "Accept": "application/json, text/event-stream"}
+        for path in ("/api/assistant/mcp", "/api/mcp"):
+            response = api.post(path, headers=headers, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+            assert response.status_code == 200, response.text
+            assert '"tools"' in response.text
+        browser.delete(f"/api/v1/auth/access-tokens/{issued['id']}")
+        assert api.post("/api/mcp", headers=headers, json={}).status_code == 401
 
 
 def test_token_migration_upgrade_downgrade_and_model_parity():
