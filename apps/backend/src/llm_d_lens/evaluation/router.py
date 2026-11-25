@@ -4571,7 +4571,12 @@ async def _cancel_evaluation(workflow: dict, case_id: str | None = None) -> dict
         errors = []
         for deployment_id in deployment_ids:
             try:
-                await deployment_run_manager.worker_for_run(deployment_id).cancel_evaluation_deployment(deployment_id)
+                # The cancelling cases and runs are still unfinished here and would make the evaluate
+                # usage probe block the very cleanup this cancellation performs.
+                with exempt_usage("evaluate"):
+                    await deployment_run_manager.worker_for_run(deployment_id).cancel_evaluation_deployment(
+                        deployment_id
+                    )
             except Exception as error:
                 errors.append(f"{deployment_id}: {error}")
         for case in targets:
