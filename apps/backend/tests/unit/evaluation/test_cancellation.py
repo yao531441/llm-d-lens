@@ -269,3 +269,21 @@ def test_simultaneous_existing_endpoint_cancels_wait_for_cleanup_and_keep_final_
         state[0].worker_for_run.assert_not_called()
 
     asyncio.run(check())
+
+
+def test_cancelling_evaluation_does_not_block_its_own_deployment_cleanup(state, monkeypatch):
+    from llm_d_lens.deploy import usage
+
+    parent = workflow([{"id": "active", "status": "benchmarking", "deployment_run_id": "owned", "execution_id": "e1"}])
+    monkeypatch.setattr(usage, "_probes", {"evaluate": router._deployment_usage_reason})
+    cleaned = []
+
+    async def clean(run_id):
+        # Stands in for the worker's clean_case, which refuses a deployment that is still in use.
+        usage.require_unused("e1")
+        cleaned.append(run_id)
+
+    state[1].cancel_evaluation_deployment.side_effect = clean
+    asyncio.run(router.cancel_workflow_run(parent["id"]))
+    assert cleaned == ["owned"]
+    assert router._get("workflow", parent["id"])["status"] == "cancelled"
