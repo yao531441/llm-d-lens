@@ -8,5 +8,6 @@ from . import (  # noqa: F401
     models,
     observe,
     resources,
+    serving,
     settings,
 )
