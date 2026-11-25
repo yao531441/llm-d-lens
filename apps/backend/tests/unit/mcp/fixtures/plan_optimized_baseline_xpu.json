@@ -1,0 +1,78 @@
+{
+ "status": "VERIFIED",
+ "source": {
+  "repository": "llm-d/llm-d",
+  "requestedRef": "v1.0.0",
+  "commit": "378b42d18dabe0b9c4ced4e6f3670d93b52db08e",
+  "guide": "optimized-baseline",
+  "accelerator": "xpu",
+  "modelServer": "vllm",
+  "variant": "base",
+  "files": [
+   "guides/optimized-baseline/modelserver/xpu/vllm/base/kustomization.yaml",
+   "guides/optimized-baseline/modelserver/xpu/vllm/base/patch-vllm.yaml",
+   "guides/optimized-baseline/modelserver/xpu/vllm/base/resource-claim-template.yaml"
+  ]
+ },
+ "plannedDeployment": {
+  "format": "yaml",
+  "content": "apiVersion: v1\nautomountServiceAccountToken: false\nkind: ServiceAccount\nmetadata:\n  labels:\n    llm-d.ai/accelerator-variant: xpu\n    llm-d.ai/accelerator-vendor: intel\n    llm-d.ai/guide: optimized-baseline\n    llm-d.ai/model: Qwen3-0.6B\n  name: optimized-baseline-xpu-vllm-sa\n---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  labels:\n    llm-d.ai/accelerator-variant: xpu\n    llm-d.ai/accelerator-vendor: intel\n    llm-d.ai/guide: optimized-baseline\n    llm-d.ai/model: Qwen3-0.6B\n    llm-d.ai/role: decode\n  name: optimized-baseline-xpu-vllm-decode\nspec:\n  replicas: 1\n  selector:\n    matchLabels:\n      llm-d.ai/accelerator-variant: xpu\n      llm-d.ai/accelerator-vendor: intel\n      llm-d.ai/guide: optimized-baseline\n      llm-d.ai/model: Qwen3-0.6B\n      llm-d.ai/role: decode\n  template:\n    metadata:\n      labels:\n        llm-d.ai/accelerator-variant: xpu\n        llm-d.ai/accelerator-vendor: intel\n        llm-d.ai/guide: optimized-baseline\n        llm-d.ai/model: Qwen3-0.6B\n        llm-d.ai/role: decode\n    spec:\n      containers:\n      - args:\n        - Qwen/Qwen3-0.6B\n        - --port=8000\n        - --dtype=float16\n        - --disable-sliding-window\n        - --disable-access-log-for-endpoints=/health,/metrics,/v1/models\n        - --shutdown-timeout=45\n        - --tensor-parallel-size=1\n        command:\n        - vllm\n        - serve\n        env:\n        - name: HF_TOKEN\n          valueFrom:\n            secretKeyRef:\n              key: HF_TOKEN\n              name: llm-d-hf-token\n              optional: true\n        - name: HTTP_PROXY\n          value: http://proxy-ir.intel.com:912\n        - name: HTTPS_PROXY\n          value: http://proxy-ir.intel.com:912\n        - name: NO_PROXY\n          value: localhost,127.0.0.1,10.112.228.229,10.112.104.73,10.112.110.115,10.112.0.0/16,192.168.1.10,192.168.1.11,192.168.1.12,192.168.1.13,192.168.239.0/24,192.168.240.0/20,10.233.0.0/18,10.233.64.0/18,svc,svc.cluster.local,10.112.229.74,10.112.110.140\n        image: ghcr.io/llm-d/llm-d-xpu:v1.0.0\n        lifecycle:\n          preStop:\n            exec:\n              command:\n              - /bin/sleep\n              - '15'\n        livenessProbe:\n          failureThreshold: 3\n          httpGet:\n            path: /health\n            port: modelserver\n          periodSeconds: 10\n          timeoutSeconds: 5\n        name: modelserver\n        ports:\n        - containerPort: 8000\n          name: modelserver\n          protocol: TCP\n        readinessProbe:\n          failureThreshold: 3\n          httpGet:\n            path: /v1/models\n            port: modelserver\n          periodSeconds: 5\n          timeoutSeconds: 2\n        resources:\n          claims:\n          - name: intel-decode-claim\n          limits:\n            cpu: '8'\n            memory: 24Gi\n          requests:\n            cpu: '4'\n            memory: 12Gi\n        startupProbe:\n          failureThreshold: 120\n          httpGet:\n            path: /v1/models\n            port: modelserver\n          initialDelaySeconds: 15\n          periodSeconds: 30\n          timeoutSeconds: 5\n        volumeMounts:\n        - mountPath: /.cache\n          name: torch-compile-cache\n        - mountPath: /.triton\n          name: triton-cache\n        - mountPath: /.config\n          name: vllm-config\n      resourceClaims:\n      - name: intel-decode-claim\n        resourceClaimTemplateName: optimized-baseline-xpu-vllm-intel-claim-template-decode\n      securityContext:\n        fsGroup: 107\n        supplementalGroups:\n        - 107\n      serviceAccountName: optimized-baseline-xpu-vllm-sa\n      terminationGracePeriodSeconds: 75\n      volumes:\n      - emptyDir: {}\n        name: torch-compile-cache\n      - emptyDir: {}\n        name: triton-cache\n      - emptyDir: {}\n        name: vllm-config\n      nodeSelector:\n        intel.feature.node.kubernetes.io/gpu: 'true'\n  progressDeadlineSeconds: 1800\n---\napiVersion: resource.k8s.io/v1\nkind: ResourceClaimTemplate\nmetadata:\n  labels:\n    llm-d.ai/role: decode\n  name: optimized-baseline-xpu-vllm-intel-claim-template-decode\nspec:\n  spec:\n    devices:\n      requests:\n      - exactly:\n          count: 1\n          deviceClassName: gpu.intel.com\n        name: intel\n---\napiVersion: v1\nkind: Service\nmetadata:\n  name: optimized-baseline-modelserver\n  labels:\n    llm-d.ai/guide: optimized-baseline\nspec:\n  selector:\n    llm-d.ai/accelerator-variant: xpu\n    llm-d.ai/accelerator-vendor: intel\n    llm-d.ai/guide: optimized-baseline\n    llm-d.ai/model: Qwen3-0.6B\n    llm-d.ai/role: decode\n  ports:\n  - name: http\n    port: 8000\n    targetPort: modelserver\n"
+ },
+ "deployment": {
+  "readinessDeployments": [
+   "optimized-baseline-xpu-vllm-decode"
+  ],
+  "endpoint": {
+   "protocol": "http",
+   "serviceName": "optimized-baseline-modelserver",
+   "port": 8000
+  }
+ },
+ "validation": {
+  "status": "warnings",
+  "errors": [],
+  "warnings": [
+   "Accelerator memory was not reported by DRA; using the known 24 GiB capacity for B60."
+  ]
+ },
+ "summary": {
+  "guideReplicas": 2,
+  "plannedReplicas": 1,
+  "tensorParallelSize": 1,
+  "tensorParallelSizeByRole": {
+   "decode": 1
+  },
+  "guideReplicasByRole": {
+   "decode": 2
+  },
+  "plannedReplicasByRole": {
+   "decode": 1
+  },
+  "acceleratorsPerReplica": 1.0,
+  "cpuPerReplica": 8.0,
+  "memoryPerReplicaGiB": 24.0,
+  "availableAccelerators": 32,
+  "resourceBasis": "available",
+  "totalAccelerators": 32,
+  "acceleratorSource": "kubernetes-dra",
+  "selectedDevicePciAddresses": [],
+  "modelEstimate": {
+   "id": "Qwen/Qwen3-0.6B",
+   "parametersBillions": 0.6,
+   "estimatedWeightMemoryGiB": 1.3,
+   "assumption": "BF16/FP16 weights plus 20% runtime overhead"
+  },
+  "modelSource": {
+   "mode": "huggingface",
+   "id": "Qwen/Qwen3-0.6B"
+  },
+  "acceleratorMemoryGiB": 24,
+  "acceleratorMemorySource": "known-model-fallback",
+  "recommendedTensorParallelSize": 1,
+  "maxRecommendedReplicas": 32,
+  "requestedAccelerators": 1.0
+ },
+ "deploymentBundle": {
+  "schemaVersion": "guide-deployment-bundle.v1"
+ }
+}
